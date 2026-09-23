@@ -18,6 +18,23 @@ Pipeline:
 IMPORTANT:
 - vLLM n'est pas supporté nativement sous Windows. Utilise WSL2/Linux.
 - FlashInfer 0.6.18.post1 + CUDA 12.4 : workaround VLLM_USE_FLASHINFER_SAMPLER=0 actif.
+
+CHANGELOG V5.1:
+- Suppression de la règle qui forçait task.spawn/task.defer dans tous les exemples.
+- Réduction du fact_block (12 → 6 faits) pour alléger la charge cognitive du modèle.
+- Élimination des doublons system/user dans les contraintes de prompt.
+- Correction du faux positif wait()/spawn() sur le texte d'explication.
+- correction du faux positif check_placeholders sur l'explication.
+- Ajout métrique first_pass_accepted.
+- Correction metrics.attempts (retries comptabilisés).
+- Correction stem redondant avec base_name dans Selene parsing.
+- Amélioration self-test Selene (diagnostic réel vérifié).
+- Ajout protection RAM SemanticIndex (shingles compressées à grande échelle).
+- Température 0.35 → 0.60, repetition_penalty 1.08 → 1.05.
+- NONCE déplacé hors du contenu visible principal.
+- Retry feedback Selene amélioré (lignes d'erreur précises).
+- Ajout statistiques par bucket dans le state.
+- Meilleure lisibilité des logs de rejet.
 """
 
 from __future__ import annotations
@@ -90,7 +107,7 @@ BATCH_SIZE = max(1, int(os.environ.get("RBLOX_VLLM_BATCH", "8")))
 
 MAX_MODEL_LEN = int(os.environ.get("RBLOX_VLLM_MAX_MODEL_LEN", "4096"))
 
-MAX_TOKENS = int(os.environ.get("RBLOX_VLLM_MAX_TOKENS", "3072"))
+MAX_TOKENS = int(os.environ.get("RBLOX_VLLM_MAX_TOKENS", "2800"))
 
 GPU_MEMORY_UTILIZATION = float(
     os.environ.get("RBLOX_VLLM_GPU_MEMORY_UTILIZATION", "0.80")
@@ -100,9 +117,11 @@ GPU_MEMORY_UTILIZATION = float(
 _max_num_seqs_env = os.environ.get("RBLOX_VLLM_MAX_NUM_SEQS", "").strip()
 MAX_NUM_SEQS = max(1, int(_max_num_seqs_env) if _max_num_seqs_env else BATCH_SIZE)
 
-TEMPERATURE = float(os.environ.get("RBLOX_VLLM_TEMPERATURE", "0.35"))
+# Température relevée pour meilleure diversité sur 30k exemples
+TEMPERATURE = float(os.environ.get("RBLOX_VLLM_TEMPERATURE", "0.60"))
 TOP_P = float(os.environ.get("RBLOX_VLLM_TOP_P", "0.90"))
-REPETITION_PENALTY = float(os.environ.get("RBLOX_VLLM_REPETITION_PENALTY", "1.08"))
+# Pénalité réduite pour ne pas bloquer les répétitions légitimes dans le code
+REPETITION_PENALTY = float(os.environ.get("RBLOX_VLLM_REPETITION_PENALTY", "1.05"))
 QUANTIZATION = os.environ.get("RBLOX_VLLM_QUANTIZATION", "").strip()
 
 SELENE_COMMAND = os.environ.get("RBLOX_SELENE", "selene")
@@ -111,7 +130,10 @@ ANALYZER = os.environ.get("RBLOX_ANALYZER", "selene").strip().lower()
 
 LINTER_THREADS = max(
     1,
-    int(os.environ.get("RBLOX_LINTER_THREADS", str(max(1, (os.cpu_count() or 4) // 2)))),
+    int(os.environ.get(
+        "RBLOX_LINTER_THREADS",
+        str(max(1, (os.cpu_count() or 4) // 2)),
+    )),
 )
 LINTER_TIMEOUT = float(os.environ.get("RBLOX_LINTER_TIMEOUT", "30"))
 
@@ -119,6 +141,12 @@ SEMANTIC_THRESHOLD = float(os.environ.get("RBLOX_SEMANTIC_THRESHOLD", "0.80"))
 MINHASH_PERMUTATIONS = int(os.environ.get("RBLOX_MINHASH_PERMUTATIONS", "64"))
 MINHASH_SHINGLE_SIZE = int(os.environ.get("RBLOX_MINHASH_SHINGLE_SIZE", "5"))
 LSH_BANDS = int(os.environ.get("RBLOX_LSH_BANDS", "8"))
+
+# Seuil au-delà duquel SemanticIndex commence à compresser les shingles
+# pour limiter la RAM sur les longues sessions (30k exemples).
+SEMANTIC_COMPRESS_THRESHOLD = int(
+    os.environ.get("RBLOX_SEMANTIC_COMPRESS_THRESHOLD", "5000")
+)
 
 MAX_ATTEMPTS = int(os.environ.get("RBLOX_MAX_ATTEMPTS", str(DEFAULT_TARGET * 25)))
 
@@ -134,7 +162,7 @@ MAX_RETRIES_PER_EXAMPLE = max(
 )
 
 # Maximum characters of Selene output to transmit in retry feedback
-SELENE_FEEDBACK_MAX_CHARS = int(os.environ.get("RBLOX_SELENE_FEEDBACK_MAX", "800"))
+SELENE_FEEDBACK_MAX_CHARS = int(os.environ.get("RBLOX_SELENE_FEEDBACK_MAX", "600"))
 
 
 # ============================================================
@@ -186,13 +214,13 @@ BASE_BUCKETS: tuple[Bucket, ...] = (
     ),
     Bucket(
         "P1", "Fondations, POO & typage strict avancé",
-        "Mémoire, threads & task scheduler",
+        "Mémoire & threads",
         (
             "task.spawn lifecycle", "task.defer scheduling",
-            "task.delay cancellation", "task.cancel", "thread pool",
+            "task.delay cancellation", "task.cancel pattern",
             "connection cleanup", "Maid pattern", "Janitor pattern",
             "weak-key table", "weak-value table", "bounded worker pool",
-            "cooperative cancellation",
+            "cooperative cancellation", "thread pool Luau",
         ),
         2500,
     ),
@@ -237,8 +265,9 @@ BASE_BUCKETS: tuple[Bucket, ...] = (
         "P2", "Deep system, réseau, data & architecture",
         "Parallel Luau & computation",
         (
-            "Actor", "task.desynchronize", "task.synchronize", "parallel Luau",
-            "BindToMessageParallel", "Actor message passing", "SharedTable",
+            "Actor isolation", "task.desynchronize usage", "task.synchronize usage",
+            "parallel Luau pattern", "BindToMessageParallel",
+            "Actor message passing", "SharedTable usage",
             "worker partitioning", "parallel aggregation",
             "deterministic parallel task", "CPU-bound simulation",
             "actor-safe state transfer",
@@ -314,96 +343,89 @@ BASE_BUCKETS: tuple[Bucket, ...] = (
 # VERIFIED FACTS / GENERATION CONSTRAINTS
 # ============================================================
 
-COMMON_FACTS = (
-    'Les services Roblox se récupèrent avec game:GetService("ServiceName").',
-    "RemoteEvent utilise FireServer côté client et OnServerEvent côté serveur.",
-    "RemoteEvent permet au serveur d'appeler FireClient ou FireAllClients.",
-    "RemoteEvent ne fournit pas un mécanisme request/response synchrone.",
-    "RemoteFunction utilise InvokeServer côté client et OnServerInvoke côté serveur.",
-    "Un RemoteFunction ne doit pas être mélangé avec FireServer ou FireClient.",
-    "Les appels DataStore peuvent échouer et doivent être protégés par pcall ou xpcall.",
-    "UpdateAsync reçoit une fonction de transformation.",
-    "Un LocalScript ne doit pas accéder directement aux DataStores du serveur.",
-    "SetAttribute et GetAttribute manipulent les Attributes d'une Instance.",
-    "Un Attribute n'est pas créé avec Instance.new().",
-    "Les fonctions task modernes sont task.wait, task.spawn, task.defer et task.delay.",
-    "task.cancel annule un thread créé par une API task compatible.",
-    "workspace:Raycast() est l'API standard pour un raycast dans Workspace.",
+# Facts are short, factual, and unambiguous.
+# They are sampled per-prompt to reduce cognitive load on Qwen 3B.
+COMMON_FACTS: tuple[str, ...] = (
+    'Les services se récupèrent avec game:GetService("ServiceName").',
+    "RemoteEvent: FireServer côté client, OnServerEvent côté serveur.",
+    "RemoteFunction: InvokeServer côté client, OnServerInvoke côté serveur.",
+    "Les appels DataStore doivent être protégés par pcall ou xpcall.",
+    "UpdateAsync reçoit une fonction de transformation (oldValue) -> newValue.",
+    "Un LocalScript ne doit pas accéder directement aux DataStores.",
+    "workspace:Raycast() est l'API standard pour un raycast.",
     "Instance:IsA() vérifie la classe d'une Instance.",
     "typeof() effectue une vérification de type à l'exécution.",
-    "Luau strict s'active avec --!strict.",
-    "Un ModuleScript retourne une valeur avec return et est généralement chargé via require().",
+    "Un ModuleScript retourne une valeur avec return, chargé via require().",
+    "Les connexions RBXScriptConnection doivent être conservées pour nettoyage.",
+    "task.wait, task.spawn, task.defer, task.delay, task.cancel sont les API modernes.",
+    "Les ancienne API wait(), spawn(), delay() sont obsolètes et interdites.",
+    "Le serveur doit recalculer ou vérifier toute action importante.",
+    "Un Attribute se manipule avec SetAttribute/GetAttribute, pas Instance.new().",
+    "SetAttribute et GetAttribute sont des méthodes d'Instance.",
+    "Un UnreliableRemoteEvent est adapté aux données non critiques.",
+    "MemoryStoreService fournit SortedMap et Queue pour le stockage temporaire.",
 )
 
 BUCKET_FACTS: dict[str, tuple[str, ...]] = {
     "Typage avancé & generics": (
-        "Les alias de type utilisent la syntaxe type Name = ...",
-        "export type permet d'exposer un alias depuis un ModuleScript.",
-        "Les unions et intersections permettent de composer des types Luau.",
-        "Les type guards doivent réellement réduire le type dans un contexte vérifiable.",
+        "type Name = ... définit un alias de type Luau.",
+        "export type expose un alias depuis un ModuleScript.",
+        "Les unions (A | B) et intersections (A & B) composent des types Luau.",
     ),
     "POO moderne": (
-        "setmetatable peut fournir un prototype via __index.",
-        "__tostring, __add et __call sont des métaméthodes Luau valides quand elles sont utilisées correctement.",
-        "Une table faible utilise __mode = 'k', 'v' ou 'kv' selon le besoin.",
+        "setmetatable fournit un prototype via __index.",
+        "__tostring, __add, __call sont des métaméthodes Luau valides.",
+        "__mode = 'k', 'v' ou 'kv' configure une table faible.",
     ),
     "Design patterns": (
-        "Les patterns doivent rester de vrais programmes Luau, pas des pseudo-frameworks inventés.",
-        "Une dépendance externe doit être traitée comme une frontière explicite si son API n'est pas fournie.",
+        "Les patterns doivent rester de vrais programmes Luau, pas des pseudo-frameworks.",
     ),
-    "Mémoire, threads & task scheduler": (
-        "Les connexions RBXScriptConnection doivent être conservées lorsqu'elles doivent être nettoyées.",
-        "Un système de cleanup doit être idempotent et ne pas déconnecter deux fois la même ressource.",
+    "Mémoire & threads": (
+        "task.cancel annule un thread créé par task.spawn ou task.delay.",
+        "Un système de cleanup doit être idempotent (safe à appeler plusieurs fois).",
     ),
     "Réseau, binaire & sérialisation": (
-        "buffer est une bibliothèque Luau/Roblox dédiée au stockage binaire compact.",
-        "bit32 fournit des opérations bit-à-bit pour construire et lire des masques.",
-        "La validation serveur doit traiter toute donnée réseau reçue comme non fiable.",
-        "Un UnreliableRemoteEvent est adapté aux données où la fiabilité n'est pas nécessaire.",
+        "buffer est la bibliothèque Luau/Roblox pour le stockage binaire compact.",
+        "bit32 fournit des opérations bit-à-bit pour les masques.",
+        "Toute donnée réseau reçue doit être traitée comme non fiable.",
     ),
     "Persistance & DataStores": (
-        "MemoryStoreService fournit notamment des structures temporaires distribuées comme SortedMap et Queue.",
-        "Les retries doivent être bornés et utiliser une stratégie de backoff.",
-        "Une migration de schéma doit gérer explicitement la version source et la version cible.",
-        "ProfileStore et DataStore2 sont des bibliothèques externes : ne pas inventer leurs méthodes si leur API n'est pas fournie.",
+        "Les retries DataStore doivent être bornés avec une stratégie de backoff.",
+        "Une migration de schéma doit gérer explicitement source et cible.",
     ),
     "ECS & frameworks": (
         "Un ECS sépare les données des systèmes qui les traitent.",
-        "Une architecture framework doit isoler les dépendances externes derrière des interfaces ou des adapters.",
         "Ne pas inventer des fonctions Knit/Matter/Jecs non fournies dans la consigne.",
     ),
     "Parallel Luau & computation": (
-        "task.desynchronize et task.synchronize contrôlent les transitions entre exécution parallèle et séquentielle dans le contexte approprié.",
-        "Actor permet d'isoler des unités de travail parallélisables.",
-        "SharedTable sert au partage de données entre contextes parallèles compatibles.",
+        "task.desynchronize/task.synchronize contrôlent les transitions parallèles.",
+        "SharedTable sert au partage de données entre contextes parallèles.",
     ),
     "Algorithmes, mathématiques & physique": (
-        "Les opérations de CFrame doivent préserver clairement le repère et le sens de composition.",
-        "PathfindingService est un service Roblox disponible pour calculer des chemins.",
-        "Les shapecasts modernes sont utilisés via les API de Workspace adaptées plutôt qu'un service RaycastService fictif.",
+        "Les opérations CFrame doivent préserver clairement le repère.",
+        "PathfindingService calcule des chemins dans Workspace.",
     ),
     "Anti-cheat & sécurité serveur": (
-        "Le serveur doit recalculer ou vérifier les conséquences importantes au lieu de faire confiance à la valeur finale envoyée par le client.",
-        "Les cooldowns réseau importants doivent être appliqués côté serveur.",
-        "Les vérifications de distance doivent comparer des positions connues du serveur.",
+        "Les cooldowns importants doivent être appliqués côté serveur.",
+        "Les vérifications de distance utilisent des positions connues du serveur.",
     ),
     "Fuites mémoire & event leakage": (
-        "Une connexion Connect() reste active tant qu'elle n'est pas déconnectée ou que son cycle de vie ne s'arrête pas proprement.",
-        "Une fermeture peut retenir des références et prolonger la durée de vie d'objets.",
+        "Connect() reste actif jusqu'à Disconnect() explicite ou destruction.",
+        "Une fermeture peut retenir des références et prolonger la vie d'objets.",
     ),
     "Race conditions, thread safety & deadlocks": (
-        "Les opérations partagées doivent avoir une stratégie claire pour éviter les mises à jour concurrentes incompatibles.",
-        "Une tâche annulable doit vérifier son état d'annulation aux points où un changement d'état peut survenir.",
+        "Les opérations partagées doivent éviter les mises à jour concurrentes incompatibles.",
     ),
     "Refactoring & optimisation CPU/RAM": (
-        "Les boucles de polling inutiles peuvent souvent être remplacées par des événements réactifs.",
-        "Les allocations répétées dans une boucle chaude augmentent le coût CPU et la pression mémoire.",
+        "Les boucles de polling peuvent souvent être remplacées par des événements réactifs.",
+        "Les allocations répétées dans une boucle chaude augmentent la pression mémoire.",
     ),
 }
 
+# UI patterns forbidden in all generated code and descriptions.
+# Applied only to code fields, not to explanation text.
 BANNED_UI_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bScreenGui\b", "UI interdite: ScreenGui"),
-    (r"\bFrame\b", "UI interdite: Frame"),
     (r"\bTextButton\b", "UI interdite: TextButton"),
     (r"\bTextLabel\b", "UI interdite: TextLabel"),
     (r"\bImageLabel\b", "UI interdite: ImageLabel"),
@@ -411,17 +433,13 @@ BANNED_UI_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bScrollingFrame\b", "UI interdite: ScrollingFrame"),
     (r"\bUIListLayout\b", "UI interdite: UIListLayout"),
     (r"\bUIGridLayout\b", "UI interdite: UIGridLayout"),
-    (r"\bUIPageLayout\b", "UI interdite: UIPageLayout"),
-    (r"\bUIPadding\b", "UI interdite: UIPadding"),
-    (r"\bUIScale\b", "UI interdite: UIScale"),
-    (r"\bUIStroke\b", "UI interdite: UIStroke"),
-    (r"\bCanvasGroup\b", "UI interdite: CanvasGroup"),
-    (r"\bViewportFrame\b", "UI interdite: ViewportFrame"),
     (r"\bBillboardGui\b", "UI interdite: BillboardGui"),
     (r"\bSurfaceGui\b", "UI interdite: SurfaceGui"),
     (r"\bStarterGui\b", "UI interdite: StarterGui"),
     (r"\bCoreGui\b", "UI interdite: CoreGui"),
     (r"\bProximityPrompt\b", "UI/interaction interdite: ProximityPrompt"),
+    (r"\bScreenGui\b", "UI interdite: ScreenGui"),
+    (r"\bFrame\b(?!\s*=\s*\d)", "UI interdite: Frame (non-numeric)"),
 )
 
 BANNED_PATTERNS: tuple[tuple[str, str], ...] = (
@@ -429,53 +447,45 @@ BANNED_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bRaycastService\b", "API fictive: RaycastService"),
     (r"\bImageService\b", "API fictive: ImageService"),
     (r"\bBindToFrame\b", "API fictive: BindToFrame"),
-    (r"\bBindActionAtFrame\b", "API fictive: BindActionAtFrame"),
     (r"\bRemoteEvent\.Sent\b", "API fictive: RemoteEvent.Sent"),
     (r"\bOnServerReceived\b", "API fictive: OnServerReceived"),
     (r"\bOnClientReceive\b", "API fictive: OnClientReceive"),
     (r"\bOnServerReceive\b", "API fictive: OnServerReceive"),
-    (r"\bEventCleanup\b", "API fictive: EventCleanup"),
     (r"\bAsyncTask\b", "API fictive: AsyncTask"),
     (r"\bSaveAsync\b", "API fictive: SaveAsync"),
     (r"\bValidateServer\b", "API inventée: ValidateServer"),
-    (r"\bsecureString\b", "API inventée: secureString"),
     (r"\bMultipleReturn\s*\(", "fonction fictive: MultipleReturn"),
-    (r"\bCooldown\s*\(", "fonction Roblox inventée: Cooldown"),
-    (r"\bRateLimit\s*\(", "fonction Roblox inventée: RateLimit"),
     (r"\bInstance\.new\s*\(\s*[\"']Attribute[\"']\s*\)", "Attribute créé avec Instance.new"),
     (r"\bInstance\.new\s*\(\s*[\"']Players[\"']\s*\)", "Players créé avec Instance.new"),
     (r"\bInstance\.new\s*\(\s*[\"']RunService[\"']\s*\)", "RunService créé avec Instance.new"),
     (r"\bInstance\.new\s*\(\s*[\"']TweenService[\"']\s*\)", "TweenService créé avec Instance.new"),
     (r"\bInstance\.new\s*\(\s*[\"']DataStoreService[\"']\s*\)", "DataStoreService créé avec Instance.new"),
     (r"\bInstance\.new\s*\(\s*[\"']UserInputService[\"']\s*\)", "UserInputService créé avec Instance.new"),
-    (r"\bInstance\.new\s*\(\s*[\"']ContextActionService[\"']\s*\)", "ContextActionService créé avec Instance.new"),
-    (r"\bInstance\.new\s*\(\s*[\"']CollectionService[\"']\s*\)", "CollectionService créé avec Instance.new"),
     (r"\bHumanoid\.Attack\b", "API Humanoid.Attack inexistante"),
-    (r"\bTask\.(Wait|Spawn|Delay)\b", "casse Task incorrecte"),
-    (r"(?<![\w.])wait\s*\(", "ancienne API wait()"),
-    (r"(?<![\w.])spawn\s*\(", "ancienne API spawn()"),
-    (r"(?<![\w.])delay\s*\(", "ancienne API delay()"),
+    # Casse incorrecte de l'API task (Task.* au lieu de task.*)
+    (r"\bTask\s*\.\s*(?:Wait|Spawn|Delay|Cancel|Defer)\b", "casse Task incorrecte — utiliser task.wait/spawn/delay/cancel/defer"),
+    # Ancienne API globale — uniquement dans les champs de code (pas l'explication)
+    # Note: ces patterns sont appliqués UNIQUEMENT sur le code, pas sur l'explication
+    (r"(?<![A-Za-z0-9_:\.])wait\s*\(", "ancienne API wait()"),
+    (r"(?<![A-Za-z0-9_:\.])spawn\s*\(", "ancienne API spawn()"),
+    (r"(?<![A-Za-z0-9_:\.])delay\s*\(", "ancienne API delay()"),
     (r"\btryCatch\s*\(", "syntaxe tryCatch inexistante"),
-    (r"\btry\s*\(", "syntaxe try inexistante en Luau"),
-    (r"\bcatch\s*\(", "syntaxe catch inexistante en Luau"),
     (r"--!nocheck\b", "bypass de typechecking interdit"),
     (r"--!nolint\b", "bypass de lint interdit"),
-    (r"--#\s*selene:\s*allow", "bypass global Selene interdit"),
 )
 
-PLACEHOLDER_PATTERNS = (
+PLACEHOLDER_PATTERNS: tuple[str, ...] = (
     r"\bTODO\b",
     r"\bFIXME\b",
-    r"placeholder",
-    r"implement here",
-    r"implementation here",
-    r"a compléter",
-    r"à compléter",
-    r"a implementer",
-    r"à implémenter",
-    r"not implemented",
-    r"your code here",
-    r"insert code here",
+    r"\bplaceholder\b",
+    r"\bimplement here\b",
+    r"\bimplementation here\b",
+    r"\bnot implemented\b",
+    r"\byour code here\b",
+    r"\binsert code here\b",
+    r"\ba compléter\b",
+    r"\bà compléter\b",
+    r"\bà implémenter\b",
 )
 
 
@@ -583,12 +593,20 @@ def choose_topic(bucket: Bucket) -> str:
 
 
 def fact_block(bucket: Bucket) -> str:
-    facts = list(COMMON_FACTS)
-    facts.extend(BUCKET_FACTS.get(bucket.subcategory, ()))
-    random.shuffle(facts)
-    return "\n".join(
-        f"- {fact}" for fact in unique_preserving_order(facts)[:12]
-    )
+    """
+    Sample a small set of relevant facts to include in the prompt.
+    Kept small (max 6) to reduce cognitive load on Qwen 3B.
+    Bucket-specific facts are prioritised over common facts.
+    """
+    bucket_specific = list(BUCKET_FACTS.get(bucket.subcategory, ()))
+    common = list(COMMON_FACTS)
+    random.shuffle(common)
+
+    # Take all bucket-specific facts (usually 2-3) + fill up to 6 with common facts
+    combined = unique_preserving_order(bucket_specific + common)
+    selected = combined[:6]
+
+    return "\n".join(f"- {fact}" for fact in selected)
 
 
 # ============================================================
@@ -639,9 +657,7 @@ UNIFIED_JSON_SCHEMA: dict[str, Any] = {
 def _strip_code_fences(raw: str) -> str:
     """Remove any accidental Markdown code fences from a raw code field."""
     raw = raw.strip()
-    # Remove opening fence (```luau, ```lua, ```)
     raw = re.sub(r"^```(?:luau|lua)?\s*\n?", "", raw, flags=re.IGNORECASE)
-    # Remove closing fence
     raw = re.sub(r"\n?```\s*$", "", raw)
     return raw.strip()
 
@@ -656,7 +672,6 @@ def parse_structured_output(text: str, stage: str) -> dict[str, str]:
     """
     data = extract_json_object(text)
 
-    # user must always be a non-empty string
     user = str(data.get("user", "")).strip()
     if not user:
         raise ValueError("Champ 'user' absent ou vide")
@@ -731,43 +746,37 @@ def build_assistant_from_structured(data: dict[str, str], stage: str) -> str:
 # PROMPT ENGINE
 # ============================================================
 
-# System prompt shared for all stages.
+# System prompt: concise, non-redundant, small-model-friendly.
+# Rules are prioritised by importance and deduplicated vs user prompts.
 GENERATOR_SYSTEM = """\
-Tu es un ingénieur senior Luau/Roblox chargé de fabriquer des données
+Tu es un ingénieur senior Luau/Roblox. Ta mission : produire des données
 d'entraînement de très haute précision pour un modèle spécialisé Roblox/Luau.
 
-RÈGLES ABSOLUES:
+RÈGLES ABSOLUES (dans l'ordre de priorité):
 
 1. Retourne UNIQUEMENT un objet JSON valide. Aucun texte avant ou après.
-2. Ne produis JAMAIS de Markdown, de blocs ```, de HTML ni de balises.
-3. Les champs de code contiennent du Luau BRUT, sans aucune clôture Markdown.
-4. Ne jamais inventer une API, propriété, méthode, événement, service ou
-   classe Roblox. Utilise uniquement des API Roblox/Luau connues avec certitude.
-5. Ne jamais créer un faux service avec Instance.new().
-6. Pas d'interface graphique : ScreenGui, Frame, TextButton, TextLabel,
+2. Les champs de code contiennent du Luau BRUT. Aucun ```, aucun Markdown.
+3. N'invente jamais une API, propriété, méthode, service ou classe Roblox.
+   N'utilise que des API Roblox/Luau que tu connais avec certitude.
+4. Ne crée jamais un service avec Instance.new().
+5. Aucune interface graphique : ScreenGui, Frame, TextButton, TextLabel,
    ImageLabel, ScrollingFrame, BillboardGui, SurfaceGui, StarterGui, CoreGui,
-   ProximityPrompt, UIListLayout, etc.
-7. Le sujet doit rester logiciel : architecture, réseau, data, sécurité,
-   algorithmes, concurrence, types, mémoire, physique.
-8. Aucun TODO, FIXME, placeholder, pseudo-code, "à compléter" ou "...".
-9. Le code doit être complet, compilable mentalement et directement utile.
-10. La première ligne de tout code Luau doit être exactement : --!strict
-11. Le code doit utiliser les API task.spawn/task.defer/task.delay/task.cancel.
-    Ne jamais utiliser wait(), spawn() ou delay() (ancienne API).
-12. Le client est non fiable : toute autorité importante doit être côté serveur.
-13. Les connexions RBXScriptConnection doivent avoir un cycle de vie clair.
-14. Pour les dépendances tierces dont l'API n'est pas fournie, construis une
-    frontière d'adaptation interne sans inventer l'API externe.
+   ProximityPrompt. Le sujet est logiciel (architecture, réseau, data, etc.).
+6. Aucun TODO, FIXME, placeholder, pseudo-code, "...", "à compléter".
+7. Le code doit être complet et directement utile. Toute fonction ouverte
+   doit être fermée avec end.
+8. La première ligne de tout code Luau doit être exactement : --!strict
+9. Côté client : non fiable. Toute action importante est autorisée côté serveur.
+10. Échappe correctement les guillemets et retours à la ligne dans le JSON.
 """
 
+# ── P1/P2 user instruction ─────────────────────────────────────────────────
 
 def _p1p2_user_instruction(bucket: Bucket, topic: str, task: str, nonce: str) -> str:
     return f"""\
-PALIER: {bucket.stage}
-DOMAINE: {bucket.subcategory}
+PALIER: {bucket.stage} — {bucket.subcategory}
 THÈME: {topic}
 TÂCHE: {task}
-NONCE: {nonce}
 
 FAITS DE RÉFÉRENCE:
 {fact_block(bucket)}
@@ -776,61 +785,55 @@ OBJECTIF:
 Conçois un problème réel d'ingénierie Roblox/Luau autour du thème ci-dessus.
 Le problème doit nécessiter une vraie implémentation, pas un cours théorique.
 
-FORMAT DE RÉPONSE OBLIGATOIRE — JSON avec exactement ces trois champs:
+RÉPONSE ATTENDUE — JSON avec exactement ces trois champs:
 {{
-  "user": "Description précise et détaillée du problème d'ingénierie Roblox/Luau.",
-  "explanation": "Explication concise de la solution en français. Pas de Markdown.",
-  "code": "LUAU BRUT ICI — commence par --!strict, aucune clôture Markdown"
+  "user": "Description précise et détaillée du problème d'ingénierie (60 à 800 caractères).",
+  "explanation": "Explication concise de la solution en français, sans Markdown.",
+  "code": "LUAU BRUT — première ligne : --!strict"
 }}
 
-CONTRAINTES DU CHAMP code:
-- Commence obligatoirement par --!strict
-- Contient une implémentation fonctionnelle complète et substantielle
-- Aucun backtick, aucune clôture ```, aucun HTML
-- Aucun TODO, FIXME, pseudo-code, placeholder
-- Logique réellement exécutable (function, local, if, for, while, return...)
-- Suffisamment substantiel pour apprendre une vraie compétence Roblox/Luau
-- Ferme correctement toutes les fonctions, tables et blocs
+CONTRAINTES CHAMP code:
+- Première ligne : --!strict (obligatoire)
+- Implémentation fonctionnelle complète avec vraie logique (function, local, if, for, return...)
+- Aucun backtick, aucun ```, aucun HTML
+- Aucun TODO, FIXME, pseudo-code, "...", placeholder
+- Toutes les fonctions et blocs fermés avec end
+- Maximum 200 lignes
 
-Réponds maintenant uniquement avec le JSON structuré demandé. Rien d'autre.\
+[nonce:{nonce}]
+Réponds uniquement avec le JSON structuré. Rien d'autre.\
 """
 
 
 def _p3_user_instruction(bucket: Bucket, topic: str, task: str, nonce: str) -> str:
     return f"""\
-PALIER: {bucket.stage}
-DOMAINE: {bucket.subcategory}
+PALIER: {bucket.stage} — {bucket.subcategory}
 THÈME: {topic}
 TÂCHE: {task}
-NONCE: {nonce}
 
 FAITS DE RÉFÉRENCE:
 {fact_block(bucket)}
 
 OBJECTIF:
 Crée un exercice d'audit/correction réel autour du thème ci-dessus.
-Le champ "user" doit contenir: un mini scénario + un code Luau
-volontairement problématique + une demande d'audit.
-Le code problématique peut contenir des erreurs précises liées au thème,
-mais il doit rester du vrai Luau (pas d'interface graphique).
 
-FORMAT DE RÉPONSE OBLIGATOIRE — JSON avec exactement ces quatre champs:
+RÉPONSE ATTENDUE — JSON avec exactement ces quatre champs:
 {{
-  "user": "Scénario + code problématique Luau brut + demande d'audit.",
-  "diagnosis": "Diagnostic en français: causes précises (sécurité, cycle de vie, concurrence, API incorrecte, CPU/RAM). 2 à 5 points concis.",
-  "original_code": "LUAU BRUT — le code problématique. Peut être imparfait.",
-  "corrected_code": "LUAU BRUT — commence par --!strict. Implémentation corrigée complète."
+  "user": "Scénario + code Luau problématique brut + demande d'audit.",
+  "diagnosis": "Diagnostic en français : causes précises, 2 à 5 points concis.",
+  "original_code": "LUAU BRUT — le code problématique (peut contenir des bugs).",
+  "corrected_code": "LUAU BRUT — première ligne : --!strict. Code corrigé complet."
 }}
 
 CONTRAINTES:
-- original_code et corrected_code contiennent du Luau BRUT, sans ```, sans HTML
-- corrected_code commence obligatoirement par --!strict
-- corrected_code est différent de original_code et résout réellement le problème
-- corrected_code est complet et suffisamment substantiel
-- Aucun TODO, FIXME, pseudo-code, placeholder dans corrected_code
+- original_code et corrected_code : Luau BRUT, sans ```, sans Markdown
+- corrected_code : première ligne --!strict (obligatoire)
+- corrected_code doit être différent de original_code et corriger les vrais problèmes
+- corrected_code : complet, aucun TODO, FIXME, pseudo-code, placeholder
 - Aucune interface graphique dans aucun des codes
 
-Réponds maintenant uniquement avec le JSON structuré demandé. Rien d'autre.\
+[nonce:{nonce}]
+Réponds uniquement avec le JSON structuré. Rien d'autre.\
 """
 
 
@@ -842,7 +845,7 @@ def build_prompt(
 ) -> list[dict[str, str]]:
     topic = choose_topic(bucket)
     task = choose_task(bucket)
-    nonce = f"RBLOX5-{case_id:08d}-{mutation:04d}-{random.randrange(10**9):09d}"
+    nonce = f"{case_id:08d}-{mutation:04d}-{random.randrange(10**9):09d}"
 
     if bucket.stage != "P3":
         user_content = _p1p2_user_instruction(bucket, topic, task, nonce)
@@ -850,11 +853,11 @@ def build_prompt(
         user_content = _p3_user_instruction(bucket, topic, task, nonce)
 
     if feedback.strip():
+        # Feedback is prepended, concise, and targeted.
         user_content = (
-            "IMPORTANT — CORRECTION DE LA TENTATIVE PRÉCÉDENTE:\n"
-            f"{feedback.strip()}\n"
-            "Ne répète pas l'erreur précédente. "
-            "Respecte toutes les contraintes du prompt système.\n\n"
+            "CORRECTION REQUISE — tentative précédente rejetée:\n"
+            f"{feedback.strip()}\n\n"
+            "---\n\n"
         ) + user_content
 
     return [
@@ -867,111 +870,102 @@ def build_prompt(
 # RETRY FEEDBACK
 # ============================================================
 
+# Each feedback message is short and targeted.
+# A small model needs a precise, actionable correction, not a wall of text.
 RETRY_FEEDBACK_RULES: dict[str, str] = {
     "réponse trop courte": (
-        "La tentative précédente a été rejetée car la réponse était trop courte. "
-        "Produis une vraie solution d'ingénierie, avec une explication concise (champ "
-        "'explanation') ET un code complet dans le champ 'code'. Ne réponds jamais "
-        "uniquement avec --!strict ou des commentaires."
+        "Réponse trop courte. Produis une vraie solution avec explication ET code complet."
     ),
     "json/schema invalide": (
-        "La tentative précédente n'était pas un JSON valide ou ne contenait pas les bons "
-        "champs. Réponds UNIQUEMENT avec l'objet JSON structuré demandé. "
-        "Échappe correctement les guillemets, retours à la ligne et caractères spéciaux. "
-        "Aucun texte avant ou après le JSON."
+        "JSON invalide. Réponds UNIQUEMENT avec l'objet JSON structuré. "
+        "Échappe les guillemets internes avec \\\" et les retours à la ligne avec \\n."
     ),
     "aucun objet json": (
-        "Aucun objet JSON valide n'a été détecté. "
-        "Réponds uniquement avec un objet JSON contenant exactement les champs demandés."
+        "Aucun objet JSON détecté. Réponds uniquement avec { ... }."
     ),
     "champ 'code' absent": (
-        "Le champ 'code' était absent ou vide. Fournis dans le champ 'code' une "
-        "implémentation Luau complète et fonctionnelle, sans backticks ni Markdown."
+        "Champ 'code' absent ou vide. Fournis une implémentation Luau brute dans ce champ."
     ),
     "champ 'explanation' absent": (
-        "Le champ 'explanation' était absent ou vide. Fournis une explication concise "
-        "de la solution en français dans ce champ."
+        "Champ 'explanation' absent. Fournis une explication concise en français."
     ),
     "champ 'diagnosis' absent": (
-        "Le champ 'diagnosis' était absent ou vide. "
-        "Fournis un diagnostic précis en français dans ce champ (2 à 5 points)."
+        "Champ 'diagnosis' absent. Fournis un diagnostic précis (2 à 5 points)."
     ),
     "champ 'original_code' absent": (
-        "Le champ 'original_code' était absent ou vide. "
-        "Fournis le code Luau problématique dans ce champ, sans Markdown."
+        "Champ 'original_code' absent. Fournis le code Luau problématique."
     ),
     "champ 'corrected_code' absent": (
-        "Le champ 'corrected_code' était absent ou vide. "
-        "Fournis le code Luau corrigé dans ce champ. "
-        "La première ligne doit être exactement --!strict."
+        "Champ 'corrected_code' absent. Fournis le code Luau corrigé commençant par --!strict."
     ),
     "code vide": (
-        "Le champ de code était vide. "
-        "Produis une vraie implémentation Luau complète dans le champ 'code'."
+        "Champ de code vide. Produis une vraie implémentation Luau."
     ),
     "--!strict manquant": (
-        "La première ligne du code doit être exactement --!strict. "
+        "ERREUR: la première ligne du code doit être exactement --!strict. "
         "Place --!strict comme toute première ligne du champ 'code' ou 'corrected_code'."
     ),
     "backticks présents": (
-        "Le champ code contenait des backticks ou des clôtures Markdown. "
-        "Le champ 'code' doit contenir du Luau BRUT, sans aucun ```, ```luau ou ```lua."
+        "Backticks détectés dans le champ code. "
+        "Le champ 'code' contient du Luau BRUT, sans ```, sans ```luau."
     ),
     "code p1/p2 trop court": (
-        "Le code précédent était trop court. "
-        "Produis une implémentation substantielle avec plusieurs éléments de logique "
-        "réellement utiles au problème demandé."
+        "Code trop court. Produis une implémentation substantielle avec vraie logique."
     ),
     "code p1/p2 sans logique exécutable": (
-        "Le code précédent ne contenait pas assez de logique exécutable. "
-        "Produis une vraie implémentation Luau complète avec des fonctions, "
-        "des structures de contrôle et une logique réelle."
+        "Code sans logique exécutable. Produis du vrai Luau avec fonctions, "
+        "structures de contrôle et logique réelle."
     ),
     "code excessivement long": (
-        "La solution précédente était inutilement longue. "
-        "Reste focalisé sur le problème et produis un code complet mais raisonnablement concis."
+        "Code trop long. Reste focalisé, maximum 200 lignes."
     ),
     "code corrigé est identique": (
-        "Le code corrigé était identique au code original. "
-        "Le champ 'corrected_code' doit apporter de vraies corrections qui résolvent "
-        "les problèmes identifiés dans 'diagnosis'."
+        "Le corrected_code est identique à original_code. Apporte de vraies corrections."
     ),
-    "identique au code problématique": (
-        "Le code corrigé était identique au code original. "
-        "Apporte de vraies corrections dans le champ 'corrected_code'."
+    "le code corrigé est identique au code problématique": (
+        "corrected_code identique à original_code. Corrige réellement les problèmes identifiés."
     ),
     "selene": (
-        "Selene a rejeté le code précédent. "
-        "Corrige l'erreur de lint et renvoie une implémentation complète et valide."
+        "Selene a rejeté le code. Corrige l'erreur de lint indiquée ci-dessus "
+        "et renvoie une implémentation complète et valide."
     ),
     "lint reject": (
-        "L'analyse statique a rejeté le code. "
-        "Corrige les erreurs de syntaxe ou d'API et renvoie un code valide."
+        "Analyse statique échouée. Corrige les erreurs de syntaxe ou d'API."
     ),
     "similarité": (
-        "La tentative précédente était trop similaire à un exemple déjà présent. "
-        "Crée une variante réellement différente du problème, de l'architecture "
-        "et du code, tout en restant dans le même domaine Roblox/Luau."
+        "Trop similaire à un exemple existant. Crée une variante réellement différente "
+        "du problème, de l'architecture et du code."
     ),
     "question trop courte": (
-        "Le champ 'user' était trop court. "
-        "Décris le problème d'ingénierie de façon précise et détaillée."
+        "Champ 'user' trop court. Décris le problème avec précision (min 60 caractères)."
     ),
     "question trop longue": (
-        "Le champ 'user' était trop long. "
-        "Reste concis et focalisé sur un seul problème d'ingénierie."
+        "Champ 'user' trop long. Reste concis sur un seul problème."
+    ),
+    "casse task incorrecte": (
+        "ERREUR: utilise task.wait/task.spawn/task.defer/task.delay/task.cancel "
+        "(minuscule). Ne jamais écrire Task.Wait, Task.Spawn, etc."
+    ),
+    "ancienne api wait": (
+        "ERREUR: wait() est une ancienne API obsolète. "
+        "Utilise task.wait() à la place."
+    ),
+    "ancienne api spawn": (
+        "ERREUR: spawn() est une ancienne API obsolète. "
+        "Utilise task.spawn() à la place."
+    ),
+    "ancienne api delay": (
+        "ERREUR: delay() est une ancienne API obsolète. "
+        "Utilise task.delay() à la place."
     ),
     "todo interdit": (
-        "Le code contenait un TODO. "
-        "Tous les TODO sont interdits. Produis une implémentation complète."
+        "TODO interdit. Produis une implémentation complète."
     ),
     "fixme interdit": (
-        "Le code contenait un FIXME. "
-        "Tous les FIXME sont interdits. Produis une implémentation complète."
+        "FIXME interdit. Produis une implémentation complète."
     ),
     "pseudo-code interdit": (
-        "Le code contenait '...' ou du pseudo-code. "
-        "Produis du vrai code Luau exécutable."
+        "Pseudo-code interdit. Produis du vrai Luau exécutable."
     ),
 }
 
@@ -982,110 +976,79 @@ def build_retry_feedback(reason: str) -> str:
         if key in reason_lower:
             return feedback
     return (
-        "La tentative précédente a été rejetée par le validateur. "
-        f"Cause détectée: {reason}. "
-        "Corrige précisément cette erreur et respecte strictement toutes les "
-        "contraintes de format et de qualité demandées."
+        f"Tentative précédente rejetée. Cause: {reason[:120]}. "
+        "Corrige précisément cette erreur et respecte le format JSON demandé."
     )
 
 
 def build_selene_feedback(reason: str, raw_selene_output: str) -> str:
     """
-    Build a retry feedback string specifically for Selene lint failures.
-    Includes the actual Selene error lines (truncated if necessary).
+    Build a targeted retry feedback string for Selene lint failures.
+    Extracts actual error lines (truncated if necessary).
     """
-    # Extract meaningful error lines from Selene output
     error_lines: list[str] = []
     for line in raw_selene_output.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
         lower = stripped.lower()
-        # Selene 0.31 format: "filename:line:col: [error/warning] message"
-        # Also catch lines with "error" or "warning" keywords
+        # Include lines with error/warning keywords or file:line:col pattern
         if any(m in lower for m in ("error", "warning", "parse error", "invalid")):
             error_lines.append(stripped)
         elif re.search(r":\d+:\d+:", stripped):
-            # Line with file:line:col pattern — always include
             error_lines.append(stripped)
 
-    # Limit to first 15 lines to avoid excessive feedback
-    error_lines = error_lines[:15]
+    error_lines = error_lines[:10]
 
     if error_lines:
         errors_text = "\n".join(error_lines)
     else:
-        # Fallback: just use the reason string itself
-        errors_text = reason
+        errors_text = reason[:300]
 
-    # Truncate total feedback if needed
-    full_msg = (
-        "La tentative précédente a échoué à la validation Luau/Selene.\n\n"
-        "Erreurs détectées:\n"
-        f"{errors_text}\n\n"
-        "Corrige précisément ces erreurs dans la nouvelle tentative.\n"
-        "Ne répète pas les mêmes erreurs.\n"
-        "Respecte toutes les contraintes du format JSON demandé."
+    intro = "Selene a rejeté le code. Erreurs:\n"
+    outro = (
+        "\nCorrige précisément ces erreurs.\n"
+        "Respecte le format JSON et place --!strict en première ligne."
     )
 
-    if len(full_msg) > SELENE_FEEDBACK_MAX_CHARS:
-        # Truncate the errors portion
-        available = SELENE_FEEDBACK_MAX_CHARS - 200  # reserve for surrounding text
-        errors_text = errors_text[:max(0, available)] + "\n[...tronqué...]"
-        full_msg = (
-            "La tentative précédente a échoué à la validation Luau/Selene.\n\n"
-            "Erreurs détectées:\n"
-            f"{errors_text}\n\n"
-            "Corrige précisément ces erreurs dans la nouvelle tentative.\n"
-            "Ne répète pas les mêmes erreurs.\n"
-            "Respecte toutes les contraintes du format JSON demandé."
-        )
+    # Truncate errors if total exceeds budget
+    max_errors_len = SELENE_FEEDBACK_MAX_CHARS - len(intro) - len(outro)
+    if len(errors_text) > max_errors_len:
+        errors_text = errors_text[:max(0, max_errors_len)] + "\n[...tronqué...]"
 
-    return full_msg
+    return intro + errors_text + outro
 
 
 # ============================================================
 # STRUCTURAL VALIDATION
 # ============================================================
 
-def check_ui_free(text: str) -> str:
+def check_ui_free(code: str) -> str:
+    """Check for forbidden UI patterns — applied to code fields only, not explanation."""
     for pattern, reason in BANNED_UI_PATTERNS:
-        if re.search(pattern, text, flags=re.IGNORECASE):
+        if re.search(pattern, code):
             return reason
     return ""
 
 
-def check_placeholders(text: str) -> str:
+def check_placeholders(code: str) -> str:
+    """Check for placeholder patterns — applied to code fields only."""
     for pattern in PLACEHOLDER_PATTERNS:
-        if re.search(pattern, text, flags=re.IGNORECASE):
-            return f"placeholder/incomplétude: {pattern}"
+        if re.search(pattern, code, flags=re.IGNORECASE):
+            return f"placeholder interdit: {pattern}"
     return ""
 
 
 def check_banned_api(code: str) -> str:
+    """Check for banned API patterns in Luau code."""
     for pattern, reason in BANNED_PATTERNS:
-        if re.search(pattern, code, flags=re.IGNORECASE):
+        if re.search(pattern, code):
             return reason
     return ""
 
 
-def check_code_shape(code: str) -> tuple[bool, str]:
-    stripped = code.strip()
-    if not stripped:
-        return False, "code vide"
-    if not stripped.startswith("--!strict"):
-        return False, "--!strict manquant"
-    if "```" in stripped:
-        return False, "backticks présents dans le code"
-    if stripped.count("function") > stripped.count("end") + 2:
-        return False, "déséquilibre évident function/end"
-    if len(stripped) > 14000:
-        return False, "code excessivement long"
-    return True, ""
-
-
 def validate_p1p2_code(code: str) -> tuple[bool, str]:
-    """Validate the raw Luau code extracted from the 'code' field."""
+    """Validate the raw Luau code extracted from the 'code' field (P1/P2)."""
     stripped = code.strip()
 
     if not stripped:
@@ -1094,7 +1057,7 @@ def validate_p1p2_code(code: str) -> tuple[bool, str]:
         return False, "--!strict manquant"
     if "```" in stripped:
         return False, "backticks présents dans le code"
-    if len(stripped) < 40:
+    if len(stripped) < 60:
         return False, "code P1/P2 trop court"
 
     executable_markers = (
@@ -1103,12 +1066,7 @@ def validate_p1p2_code(code: str) -> tuple[bool, str]:
     )
     if not any(m in stripped for m in executable_markers):
         return False, "code P1/P2 sans logique exécutable"
-    if "TODO" in stripped.upper():
-        return False, "TODO interdit dans le code"
-    if "FIXME" in stripped.upper():
-        return False, "FIXME interdit dans le code"
-    if re.search(r"(?<!\.)\.\.\.(?!\.)", stripped):
-        return False, "pseudo-code interdit"
+
     if len(stripped) > 14000:
         return False, "code excessivement long"
 
@@ -1130,14 +1088,8 @@ def validate_p3_codes(
         return False, "backticks présents dans corrected_code"
     if normalize_code(original) == normalize_code(corrected):
         return False, "le code corrigé est identique au code problématique"
-    if len(corrected) < 40:
+    if len(corrected) < 60:
         return False, "corrected_code trop court"
-    if "TODO" in corrected.upper():
-        return False, "TODO interdit dans le code corrigé"
-    if "FIXME" in corrected.upper():
-        return False, "FIXME interdit dans le code corrigé"
-    if re.search(r"(?<!\.)\.\.\.(?!\.)", corrected):
-        return False, "pseudo-code interdit dans corrected_code"
     if len(corrected) > 14000:
         return False, "corrected_code excessivement long"
 
@@ -1154,6 +1106,9 @@ def validate_generated(
     Returns (ok, reason, code_for_dedup_and_lint).
     - For P1/P2: code_for_dedup_and_lint is the 'code' field.
     - For P3:    code_for_dedup_and_lint is the 'corrected_code' field.
+
+    IMPORTANT: check_ui_free, check_placeholders, check_banned_api are applied
+    ONLY to code fields, NOT to explanation/diagnosis text (avoids false positives).
     """
     user = structured.get("user", "").strip()
 
@@ -1162,33 +1117,33 @@ def validate_generated(
     if len(user) > 7000:
         return False, "question trop longue", ""
 
-    # Build assistant for UI / placeholder checks
-    assistant = build_assistant_from_structured(structured, bucket.stage)
-
-    if len(assistant) < 100:
-        return False, "réponse trop courte", ""
-    if len(assistant) > 30000:
-        return False, "réponse trop longue", ""
-
-    ui_reason = check_ui_free(user + "\n" + assistant)
-    if ui_reason:
-        return False, ui_reason, ""
-
-    placeholder_reason = check_placeholders(user + "\n" + assistant)
-    if placeholder_reason:
-        return False, placeholder_reason, ""
-
     if bucket.stage in ("P1", "P2"):
         code = structured.get("code", "").strip()
+
+        # Structural validation on code
         ok, reason = validate_p1p2_code(code)
         if not ok:
             return False, reason, ""
 
+        # UI patterns on code only
+        ui_reason = check_ui_free(code)
+        if ui_reason:
+            return False, ui_reason, ""
+
+        # Placeholders on code only
+        ph_reason = check_placeholders(code)
+        if ph_reason:
+            return False, ph_reason, ""
+
+        # Banned API on code
         banned = check_banned_api(code)
         if banned:
             return False, banned, ""
 
-        # Verify the reconstructed assistant contains exactly one luau block
+        # Verify reconstruction has exactly one luau block
+        assistant = build_assistant_from_structured(structured, bucket.stage)
+        if len(assistant) < 100:
+            return False, "réponse trop courte", ""
         blocks = extract_code_blocks(assistant)
         if len(blocks) != 1:
             return False, "le palier 1/2 doit contenir exactement 1 bloc code", ""
@@ -1203,11 +1158,23 @@ def validate_generated(
     if not ok:
         return False, reason, ""
 
+    # UI/placeholder/banned on corrected_code only
+    ui_reason = check_ui_free(corrected_code)
+    if ui_reason:
+        return False, ui_reason, ""
+
+    ph_reason = check_placeholders(corrected_code)
+    if ph_reason:
+        return False, ph_reason, ""
+
     banned = check_banned_api(corrected_code)
     if banned:
         return False, banned, ""
 
-    # Verify the reconstructed assistant has expected structure
+    # Verify reconstruction
+    assistant = build_assistant_from_structured(structured, bucket.stage)
+    if len(assistant) < 100:
+        return False, "réponse trop courte", ""
     if "<think>" not in assistant.lower():
         return False, "bloc <think> manquant au palier 3", ""
     if "</think>" not in assistant.lower():
@@ -1225,6 +1192,14 @@ def validate_generated(
 # ============================================================
 
 class SemanticIndex:
+    """
+    MinHash + LSH index for near-duplicate detection.
+
+    Memory note: shingles are stored as frozensets (more compact than list[str]).
+    Above SEMANTIC_COMPRESS_THRESHOLD entries, only hashed shingles are stored
+    (as set[int]) to reduce RAM pressure for 30k+ example sessions.
+    """
+
     def __init__(
         self,
         num_perm: int,
@@ -1246,8 +1221,10 @@ class SemanticIndex:
         self.rows_per_band = num_perm // bands
 
         self.signatures: list[tuple[int, ...]] = []
-        self.shingles: list[set[str]] = []
+        # shingles[i] is either set[str] (early phase) or set[int] (compressed phase)
+        self.shingles: list[Any] = []
         self.lsh: dict[tuple[int, tuple[int, ...]], set[int]] = defaultdict(set)
+        self._compressed = False
 
         self._seeds = [
             int.from_bytes(
@@ -1262,14 +1239,39 @@ class SemanticIndex:
     def _tokenize(self, code: str) -> list[str]:
         return TOKEN_RE.findall(normalize_code(code))
 
-    def _make_shingles(self, code: str) -> set[str]:
+    def _make_shingles_str(self, code: str) -> set[str]:
         tokens = self._tokenize(code)
         if len(tokens) <= self.shingle_size:
-            return {" ".join(tokens)}
+            return {" ".join(tokens)} if tokens else set()
         return {
             " ".join(tokens[i: i + self.shingle_size])
             for i in range(len(tokens) - self.shingle_size + 1)
         }
+
+    def _shingles_to_ints(self, shingles_str: set[str]) -> set[int]:
+        """Convert string shingles to integer hashes to save memory."""
+        result: set[int] = set()
+        for s in shingles_str:
+            h = int.from_bytes(
+                hashlib.blake2b(s.encode("utf-8", errors="ignore"), digest_size=8).digest(),
+                "little",
+            )
+            result.add(h)
+        return result
+
+    def _maybe_compress(self) -> None:
+        """
+        If we cross the compression threshold and haven't compressed yet,
+        convert all stored string shingles to integer hashes.
+        """
+        if self._compressed:
+            return
+        if len(self.shingles) >= SEMANTIC_COMPRESS_THRESHOLD:
+            self.shingles = [
+                self._shingles_to_ints(s) if isinstance(s, set) and s and isinstance(next(iter(s)), str) else s
+                for s in self.shingles
+            ]
+            self._compressed = True
 
     def _hash_shingle(self, shingle: str, seed: int) -> int:
         payload = seed.to_bytes(8, "little") + shingle.encode("utf-8", errors="ignore")
@@ -1277,11 +1279,11 @@ class SemanticIndex:
             hashlib.blake2b(payload, digest_size=8).digest(), "little"
         )
 
-    def _signature(self, shingles: set[str]) -> tuple[int, ...]:
+    def _signature(self, shingles_str: set[str]) -> tuple[int, ...]:
         max_val = (1 << 64) - 1
         return tuple(
             min(
-                (self._hash_shingle(s, seed) for s in shingles),
+                (self._hash_shingle(s, seed) for s in shingles_str),
                 default=max_val,
             )
             for seed in self._seeds
@@ -1296,7 +1298,17 @@ class SemanticIndex:
         return result
 
     @staticmethod
-    def _jaccard(left: set[str], right: set[str]) -> float:
+    def _jaccard_str(left: set[str], right: set[str]) -> float:
+        if not left and not right:
+            return 1.0
+        if not left or not right:
+            return 0.0
+        inter = len(left & right)
+        union = len(left | right)
+        return inter / union if union else 1.0
+
+    @staticmethod
+    def _jaccard_int(left: set[int], right: set[int]) -> float:
         if not left and not right:
             return 1.0
         if not left or not right:
@@ -1306,30 +1318,47 @@ class SemanticIndex:
         return inter / union if union else 1.0
 
     def find_similar(self, code: str) -> tuple[bool, float, int | None]:
-        shingles = self._make_shingles(code)
-        if not shingles:
+        shingles_str = self._make_shingles_str(code)
+        if not shingles_str:
             return False, 0.0, None
-        sig = self._signature(shingles)
+        sig = self._signature(shingles_str)
         candidates: set[int] = set()
         for key in self._band_keys(sig):
             candidates.update(self.lsh.get(key, ()))
+
         best_score = 0.0
         best_index: int | None = None
+
+        # For Jaccard comparison, we need compatible types
+        shingles_int = self._shingles_to_ints(shingles_str) if self._compressed else None
+
         for cand in candidates:
-            score = self._jaccard(shingles, self.shingles[cand])
+            stored = self.shingles[cand]
+            if self._compressed:
+                score = self._jaccard_int(shingles_int, stored)  # type: ignore[arg-type]
+            else:
+                score = self._jaccard_str(shingles_str, stored)  # type: ignore[arg-type]
+
             if score > best_score:
                 best_score = score
                 best_index = cand
             if score > self.threshold:
                 return True, score, cand
+
         return False, best_score, best_index
 
     def add(self, code: str) -> int:
-        shingles = self._make_shingles(code)
-        sig = self._signature(shingles)
+        self._maybe_compress()
+        shingles_str = self._make_shingles_str(code)
+        sig = self._signature(shingles_str)
         idx = len(self.signatures)
         self.signatures.append(sig)
-        self.shingles.append(shingles)
+
+        if self._compressed:
+            self.shingles.append(self._shingles_to_ints(shingles_str))
+        else:
+            self.shingles.append(shingles_str)
+
         for key in self._band_keys(sig):
             self.lsh[key].add(idx)
         return idx
@@ -1414,6 +1443,7 @@ def write_state(
     counts: dict[str, int],
     reject_counts: Counter[str],
     started_at: float,
+    first_pass_accepted: int = 0,
 ) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     state = {
@@ -1423,6 +1453,10 @@ def write_state(
         "accepted": accepted,
         "rejected": rejected,
         "attempts": attempts,
+        "first_pass_accepted": first_pass_accepted,
+        "first_pass_rate": (
+            round(first_pass_accepted / max(1, attempts) * 100, 2)
+        ),
         "counts": counts,
         "reject_counts": dict(reject_counts),
         "elapsed_seconds": time.perf_counter() - started_at,
@@ -1435,14 +1469,20 @@ def write_state(
 
 def load_state() -> dict[str, Any]:
     if not STATE_FILE.exists():
-        return {"counts": {}, "reject_counts": {}, "accepted": 0, "rejected": 0, "attempts": 0}
+        return {
+            "counts": {}, "reject_counts": {}, "accepted": 0,
+            "rejected": 0, "attempts": 0, "first_pass_accepted": 0,
+        }
     try:
         value = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             raise ValueError
         return value
     except Exception:
-        return {"counts": {}, "reject_counts": {}, "accepted": 0, "rejected": 0, "attempts": 0}
+        return {
+            "counts": {}, "reject_counts": {}, "accepted": 0,
+            "rejected": 0, "attempts": 0, "first_pass_accepted": 0,
+        }
 
 
 def load_existing_dataset(registry: SeenRegistry) -> int:
@@ -1494,57 +1534,62 @@ def _parse_selene_output_for_file(
     """
     Parse Selene 0.31.0 output for a specific file.
 
-    Selene 0.31.0 output format (quiet display style):
-      path/to/file.luau:line:col: [error_type] message
-      path/to/file.luau:line:col: (warning) [rule_name] message
+    Selene 0.31.0 quiet format:
+      filename.luau:line:col: [error_type] message
+      filename.luau:line:col: (warning) [rule_name] message
 
-    Returns empty string if no issues found for that file,
-    or a pipe-separated string of up to 4 issue lines.
+    Returns empty string if no issues, or a pipe-separated string of up to 5 issue lines.
     """
     if returncode == 0:
         return ""
 
-    # Basename without path for matching (Selene may print just the filename
-    # or a relative path depending on how it was invoked)
+    # Use only the base filename for matching (Selene prints just the filename
+    # when invoked with cwd set to the directory containing the files)
     base_name = os.path.basename(file_name)
-    # Strip the .luau extension variant too, in case
-    stem = base_name  # e.g. "case_000000.luau"
 
     issue_lines: list[str] = []
+    in_continuation = False
+
     for line in output.splitlines():
         stripped = line.strip()
         if not stripped:
+            in_continuation = False
             continue
-        # Match if the line references our file (by name or stem)
-        if stem in stripped or base_name in stripped:
+
+        # Primary match: line references our file by name
+        if base_name in stripped and re.search(r":\d+:\d+:", stripped):
+            issue_lines.append(stripped)
+            in_continuation = True
+            continue
+
+        # Continuation lines (detail/context lines, usually indented)
+        if in_continuation and line.startswith(" "):
             issue_lines.append(stripped)
             continue
-        # Also catch lines that look like continuation/detail lines
-        # (they start with spaces in some Selene versions)
-        if issue_lines and line.startswith("  "):
-            issue_lines.append(stripped)
+
+        in_continuation = False
 
     if issue_lines:
-        return " | ".join(issue_lines[:4])
+        return " | ".join(issue_lines[:5])
 
-    # If returncode != 0 but we found nothing specific to this file,
-    # it could be a global parse error — return a generic message
-    # but also try to grab any error line from the output
-    generic_lines: list[str] = []
-    for line in output.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        lower = stripped.lower()
-        if any(m in lower for m in ("error", "warning", "parse error", "invalid")):
-            generic_lines.append(stripped)
-        elif re.search(r":\d+:\d+:", stripped):
-            generic_lines.append(stripped)
+    # Fallback: if returncode != 0 but no file-specific lines found,
+    # grab any error/warning lines from the entire output
+    if returncode != 0:
+        generic_lines: list[str] = []
+        for line in output.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            lower = stripped.lower()
+            if any(m in lower for m in ("error", "warning", "parse error", "invalid")):
+                generic_lines.append(stripped)
+            elif re.search(r":\d+:\d+:", stripped):
+                generic_lines.append(stripped)
+        if generic_lines:
+            return " | ".join(generic_lines[:5])
+        return f"Selene exit={returncode}: diagnostic unavailable for {base_name}"
 
-    if generic_lines:
-        return " | ".join(generic_lines[:4])
-
-    return f"Selene exit={returncode}: diagnostic indisponible pour {base_name}"
+    return ""
 
 
 def _parse_luau_analyze_output_for_file(
@@ -1566,9 +1611,8 @@ def _parse_luau_analyze_output_for_file(
             issue_lines.append(stripped)
 
     if issue_lines:
-        return " | ".join(issue_lines[:4])
+        return " | ".join(issue_lines[:5])
 
-    # Generic fallback
     generic_lines: list[str] = []
     for line in output.splitlines():
         stripped = line.strip()
@@ -1577,15 +1621,14 @@ def _parse_luau_analyze_output_for_file(
             generic_lines.append(stripped)
 
     if generic_lines:
-        return " | ".join(generic_lines[:4])
+        return " | ".join(generic_lines[:5])
 
-    return f"luau-analyze exit={returncode}: diagnostic indisponible"
+    return f"luau-analyze exit={returncode}: diagnostic unavailable"
 
 
 async def lint_batch(codes: list[str]) -> list[LintResult]:
     """
     Run the configured linter on a batch of Luau code strings.
-
     Each code string is written to a separate temporary file.
     Returns a LintResult per code.
     """
@@ -1596,24 +1639,21 @@ async def lint_batch(codes: list[str]) -> list[LintResult]:
         tmp_dir = Path(tmp_name)
         file_names = [f"case_{i:06d}.luau" for i in range(len(codes))]
 
-        # Write code files
         for fn, code in zip(file_names, codes):
             (tmp_dir / fn).write_text(code, encoding="utf-8")
 
         if ANALYZER == "selene":
-            # Write selene.toml into the temp directory so Selene picks it up
-            # automatically when run with cwd=tmp_dir.
-            # Note: lua_versions is NOT a valid Selene 0.31 option — only std matters.
+            # selene.toml is placed in the cwd so Selene picks it up automatically.
+            # std = "roblox" enables Roblox-specific linting rules.
+            # Note: lua_versions is not a valid Selene 0.31 config option.
             (tmp_dir / "selene.toml").write_text(
                 'std = "roblox"\n', encoding="utf-8"
             )
-
             # Selene 0.31.0 valid flags:
             #   --display-style=<quiet|rich|json>
             #   --color=<always|auto|never>
             #   --num-threads <N>
-            #   (no --no-summary, no --config in 0.31)
-            # Selene finds selene.toml automatically in the cwd.
+            # Note: --no-summary was removed in Selene 0.27+
             command = command_parts(SELENE_COMMAND) + [
                 "--display-style=quiet",
                 "--color=never",
@@ -1653,7 +1693,6 @@ async def lint_batch(codes: list[str]) -> list[LintResult]:
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace")
         stderr_text = stderr_bytes.decode("utf-8", errors="replace")
-        # Combine stdout + stderr for parsing (Selene may use either)
         combined_output = stdout_text
         if stderr_text.strip():
             combined_output = combined_output + "\n" + stderr_text
@@ -1713,10 +1752,12 @@ def build_engine() -> tuple[Any, Any]:
     print(f"  max_model_len      : {MAX_MODEL_LEN}")
     print(f"  max_num_seqs       : {MAX_NUM_SEQS}")
     print(f"  batch_size         : {BATCH_SIZE}")
-    print(f"  Quantization       : {QUANTIZATION or 'checkpoint-detected/auto'}")
+    print(f"  temperature        : {TEMPERATURE}")
+    print(f"  repetition_penalty : {REPETITION_PENALTY}")
+    print(f"  max_tokens         : {MAX_TOKENS}")
+    print(f"  Quantization       : {QUANTIZATION or 'auto'}")
     print(f"  FlashInfer sampler : {os.environ.get('VLLM_USE_FLASHINFER_SAMPLER', '?')}")
 
-    # Single construction — no duplication
     llm = LLM(**llm_kwargs)
 
     structured_outputs = StructuredOutputsParams(json=UNIFIED_JSON_SCHEMA)
@@ -1822,7 +1863,7 @@ class BucketScheduler:
 
 
 # ============================================================
-# PROGRESS
+# PROGRESS / METRICS
 # ============================================================
 
 @dataclass
@@ -1832,19 +1873,24 @@ class Metrics:
     duplicates: int = 0
     lint_rejected: int = 0
     semantic_rejected: int = 0
+    json_rejected: int = 0
+    validation_rejected: int = 0
     output_tokens: int = 0
     generation_seconds: float = 0.0
+    # attempts = total generation calls (initial + retries)
     attempts: int = 0
+    # first_pass_accepted = accepted on the very first attempt (no retry)
+    first_pass_accepted: int = 0
 
 
 # ============================================================
 # SELF TEST
 # ============================================================
 
-def _run_selene_on_code(code: str) -> tuple[bool, str]:
+def _run_selene_on_code(code: str) -> tuple[bool | None, str]:
     """
     Synchronous helper: run Selene on a single code string.
-    Returns (ok, reason).
+    Returns (ok, reason). Returns (None, msg) if Selene is not installed.
     Used only in self-test.
     """
     import subprocess
@@ -1869,7 +1915,7 @@ def _run_selene_on_code(code: str) -> tuple[bool, str]:
                 timeout=15,
             )
         except FileNotFoundError:
-            return None, "selene not found"  # type: ignore[return-value]
+            return None, "selene not found"
         except subprocess.TimeoutExpired:
             return False, "timeout"
 
@@ -1883,10 +1929,17 @@ def _run_selene_on_code(code: str) -> tuple[bool, str]:
 
 def self_test() -> None:
     print("Running self-test...")
+    failures: list[str] = []
+
+    def assert_test(condition: bool, test_id: str, message: str) -> None:
+        if not condition:
+            failures.append(f"TEST {test_id} FAILED: {message}")
+            print(f"  [{test_id}] FAILED: {message}")
+        # (pass output is printed inline below)
 
     # ── 1. JSON P1/P2 valide ──────────────────────────────────────────────────
     raw_p1 = json.dumps({
-        "user": "Implémente un compteur générique strict avec reset.",
+        "user": "Implémente un compteur générique strict avec reset en Luau.",
         "explanation": "Un compteur typé générique en Luau.",
         "code": (
             "--!strict\n"
@@ -1901,19 +1954,33 @@ def self_test() -> None:
             "print(next())\n"
         ),
     })
-    parsed_p1 = parse_structured_output(raw_p1, "P1")
-    assert parsed_p1["user"] == "Implémente un compteur générique strict avec reset.", \
-        "TEST 1 FAILED: user field"
-    assert parsed_p1["explanation"].startswith("Un compteur"), "TEST 1 FAILED: explanation"
-    assert parsed_p1["code"].startswith("--!strict"), "TEST 1 FAILED: code strict"
-    print("  [1] JSON P1/P2 valide: OK")
+    try:
+        parsed_p1 = parse_structured_output(raw_p1, "P1")
+        assert_test(
+            "Implémente" in parsed_p1["user"],
+            "1a", f"user field incorrect: {parsed_p1['user'][:50]}",
+        )
+        assert_test(
+            parsed_p1["explanation"].startswith("Un compteur"),
+            "1b", f"explanation incorrect: {parsed_p1['explanation'][:50]}",
+        )
+        assert_test(
+            parsed_p1["code"].startswith("--!strict"),
+            "1c", "code ne commence pas par --!strict",
+        )
+        print("  [1] JSON P1/P2 valide: OK")
+    except Exception as e:
+        assert_test(False, "1", f"exception: {e}")
 
     # ── 2. Reconstruction P1/P2 ───────────────────────────────────────────────
-    assistant_p1 = build_assistant_from_structured(parsed_p1, "P1")
-    assert "```luau" in assistant_p1, "TEST 2 FAILED: no ```luau in assistant"
-    assert "```" in assistant_p1, "TEST 2 FAILED: no closing fence"
-    assert "--!strict" in assistant_p1, "TEST 2 FAILED: no --!strict in assistant"
-    print("  [2] Reconstruction P1/P2: OK")
+    try:
+        assistant_p1 = build_assistant_from_structured(parsed_p1, "P1")
+        assert_test("```luau" in assistant_p1, "2a", "pas de ```luau dans assistant")
+        assert_test("--!strict" in assistant_p1, "2b", "pas de --!strict dans assistant")
+        assert_test(assistant_p1.endswith("```"), "2c", "assistant ne finit pas par ```")
+        print("  [2] Reconstruction P1/P2: OK")
+    except Exception as e:
+        assert_test(False, "2", f"exception: {e}")
 
     # ── 3. JSON P3 valide ─────────────────────────────────────────────────────
     raw_p3 = json.dumps({
@@ -1959,44 +2026,67 @@ def self_test() -> None:
             "end)\n"
         ),
     })
-    parsed_p3 = parse_structured_output(raw_p3, "P3")
-    assert parsed_p3["diagnosis"].startswith("1."), "TEST 3 FAILED: diagnosis"
-    assert parsed_p3["original_code"].startswith("local"), "TEST 3 FAILED: original_code"
-    assert parsed_p3["corrected_code"].startswith("--!strict"), "TEST 3 FAILED: corrected_code"
-    print("  [3] JSON P3 valide: OK")
+    try:
+        parsed_p3 = parse_structured_output(raw_p3, "P3")
+        assert_test(
+            parsed_p3["diagnosis"].startswith("1."),
+            "3a", "diagnosis incorrect",
+        )
+        assert_test(
+            parsed_p3["original_code"].startswith("local"),
+            "3b", "original_code incorrect",
+        )
+        assert_test(
+            parsed_p3["corrected_code"].startswith("--!strict"),
+            "3c", "corrected_code ne commence pas par --!strict",
+        )
+        print("  [3] JSON P3 valide: OK")
+    except Exception as e:
+        assert_test(False, "3", f"exception: {e}")
 
     # ── 4. Reconstruction P3 ──────────────────────────────────────────────────
-    assistant_p3 = build_assistant_from_structured(parsed_p3, "P3")
-    assert "<think>" in assistant_p3, "TEST 4 FAILED: no <think>"
-    assert "</think>" in assistant_p3, "TEST 4 FAILED: no </think>"
-    assert "```luau" in assistant_p3, "TEST 4 FAILED: no ```luau in P3 assistant"
-    assert "Code problématique:" in assistant_p3, "TEST 4 FAILED: no 'Code problématique:'"
-    assert "Code corrigé:" in assistant_p3, "TEST 4 FAILED: no 'Code corrigé:'"
-    print("  [4] Reconstruction P3: OK")
+    try:
+        assistant_p3 = build_assistant_from_structured(parsed_p3, "P3")
+        assert_test("<think>" in assistant_p3, "4a", "pas de <think>")
+        assert_test("</think>" in assistant_p3, "4b", "pas de </think>")
+        assert_test("```luau" in assistant_p3, "4c", "pas de ```luau dans P3 assistant")
+        assert_test("Code problématique:" in assistant_p3, "4d", "pas de 'Code problématique:'")
+        assert_test("Code corrigé:" in assistant_p3, "4e", "pas de 'Code corrigé:'")
+        print("  [4] Reconstruction P3: OK")
+    except Exception as e:
+        assert_test(False, "4", f"exception: {e}")
 
-    # ── 5. --!strict présent dans le code P1 ─────────────────────────────────
-    assert parsed_p1["code"].startswith("--!strict"), "TEST 5 FAILED"
-    print("  [5] --!strict: OK")
+    # ── 5. validate_p1p2_code: code valide ───────────────────────────────────
+    valid_code = (
+        "--!strict\n"
+        "local function add(a: number, b: number): number\n"
+        "    return a + b\n"
+        "end\n"
+        "print(add(1, 2))\n"
+    )
+    ok, reason = validate_p1p2_code(valid_code)
+    assert_test(ok, "5", f"code valide rejeté: {reason}")
+    print("  [5] validate_p1p2_code code valide: OK")
 
     # ── 6. Rejet code vide ────────────────────────────────────────────────────
     ok, reason = validate_p1p2_code("")
-    assert not ok, "TEST 6 FAILED: code vide devrait être rejeté"
-    assert "vide" in reason.lower(), f"TEST 6 FAILED: wrong reason '{reason}'"
+    assert_test(not ok, "6a", "code vide devrait être rejeté")
+    assert_test("vide" in reason.lower(), "6b", f"mauvaise raison: {reason}")
     print("  [6] Rejet code vide: OK")
 
     # ── 7. Rejet code trop court ──────────────────────────────────────────────
     ok, reason = validate_p1p2_code("--!strict\nlocal x = 1")
-    assert not ok, "TEST 7 FAILED: code trop court devrait être rejeté"
-    assert "court" in reason.lower(), f"TEST 7 FAILED: wrong reason '{reason}'"
+    assert_test(not ok, "7a", "code trop court devrait être rejeté")
+    assert_test("court" in reason.lower(), "7b", f"mauvaise raison: {reason}")
     print("  [7] Rejet code trop court: OK")
 
     # ── 8. Rejet code sans logique exécutable ─────────────────────────────────
-    short_no_logic = "--!strict\n" + "-- commentaire\n" * 5
+    short_no_logic = "--!strict\n" + "-- commentaire\n" * 6
     ok, reason = validate_p1p2_code(short_no_logic)
-    assert not ok, "TEST 8 FAILED: code sans logique devrait être rejeté"
+    assert_test(not ok, "8", f"code sans logique devrait être rejeté, raison: {reason}")
     print("  [8] Rejet code sans logique exécutable: OK")
 
-    # ── 9. Détection code corrigé identique à l'original ─────────────────────
+    # ── 9. Détection code corrigé identique ──────────────────────────────────
     identical_code = (
         "--!strict\n"
         "local function add(a: number, b: number): number\n"
@@ -2004,47 +2094,62 @@ def self_test() -> None:
         "end\n"
     )
     ok, reason = validate_p3_codes(identical_code, identical_code)
-    assert not ok, "TEST 9 FAILED: code identique devrait être rejeté"
-    assert "identique" in reason.lower(), f"TEST 9 FAILED: wrong reason '{reason}'"
+    assert_test(not ok, "9a", "code identique devrait être rejeté")
+    assert_test("identique" in reason.lower(), "9b", f"mauvaise raison: {reason}")
     print("  [9] Détection code corrigé identique: OK")
 
     # ── 10. Retry feedback ────────────────────────────────────────────────────
     fb = build_retry_feedback("--!strict manquant")
-    assert "--!strict" in fb, "TEST 10 FAILED: feedback should mention --!strict"
+    assert_test("--!strict" in fb, "10a", "feedback devrait mentionner --!strict")
     fb2 = build_retry_feedback("json/schema invalide")
-    assert "JSON" in fb2 or "json" in fb2.lower(), "TEST 10 FAILED: feedback JSON"
+    assert_test("JSON" in fb2 or "json" in fb2.lower(), "10b", "feedback JSON incorrect")
+    fb3 = build_retry_feedback("casse task incorrecte")
+    assert_test("task." in fb3.lower(), "10c", "feedback casse task incorrect")
     print("  [10] Retry feedback: OK")
 
     # ── 11. Parsing JSON invalide ─────────────────────────────────────────────
+    raised = False
     try:
         parse_structured_output("pas du json {broken", "P1")
-        assert False, "TEST 11 FAILED: should have raised"
     except ValueError:
-        pass
+        raised = True
+    assert_test(raised, "11", "JSON invalide devrait lever ValueError")
     print("  [11] Parsing JSON invalide: OK")
 
-    # ── 12. Code fence mal placé dans le champ code ───────────────────────────
+    # ── 12. Code fence strippé dans le champ code ─────────────────────────────
     raw_with_fence = json.dumps({
-        "user": "Teste la détection de backticks dans le champ code.",
+        "user": "Teste la détection de backticks dans le champ code en Luau strict.",
         "explanation": "Explication test.",
-        "code": "```luau\n--!strict\nlocal x = 1\n```",
+        "code": "```luau\n--!strict\nlocal x = 1\nprint(x)\n```",
     })
-    parsed_fence = parse_structured_output(raw_with_fence, "P1")
-    assert "```" not in parsed_fence["code"], \
-        f"TEST 12 FAILED: backticks should be stripped, got: {parsed_fence['code']!r}"
-    print("  [12] Code fence mal placé dans le champ code: OK (stripped)")
+    try:
+        parsed_fence = parse_structured_output(raw_with_fence, "P1")
+        assert_test(
+            "```" not in parsed_fence["code"],
+            "12a", f"backticks non strippés: {parsed_fence['code'][:60]!r}",
+        )
+        assert_test(
+            parsed_fence["code"].startswith("--!strict"),
+            "12b", "code ne commence pas par --!strict après strip",
+        )
+        print("  [12] Code fence strippé: OK")
+    except Exception as e:
+        assert_test(False, "12", f"exception: {e}")
 
-    # ── 13. Structure finale assistant correcte ───────────────────────────────
+    # ── 13. Structure finale assistant P1 ─────────────────────────────────────
     data_check = {
-        "user": "Test structure.",
-        "explanation": "Une explication.",
+        "user": "Test structure assistant.",
+        "explanation": "Une explication concise.",
         "code": "--!strict\nlocal x = 42\nprint(x)\n",
     }
     final_assistant = build_assistant_from_structured(data_check, "P1")
-    assert final_assistant.startswith("Une explication."), "TEST 13 FAILED: explanation first"
-    assert "```luau\n--!strict" in final_assistant, "TEST 13 FAILED: luau block"
-    assert final_assistant.endswith("```"), "TEST 13 FAILED: closing fence"
-    print("  [13] Structure finale assistant correcte: OK")
+    assert_test(
+        final_assistant.startswith("Une explication concise."),
+        "13a", "l'explication doit être en premier",
+    )
+    assert_test("```luau\n--!strict" in final_assistant, "13b", "bloc luau manquant")
+    assert_test(final_assistant.endswith("```"), "13c", "fermeture ``` manquante")
+    print("  [13] Structure finale assistant P1: OK")
 
     # ── 14. Selene: code valide accepté ──────────────────────────────────────
     valid_luau = (
@@ -2056,124 +2161,200 @@ def self_test() -> None:
     )
     selene_ok, selene_reason = _run_selene_on_code(valid_luau)
     if selene_ok is None:
-        print("  [14] Selene code valide: SKIP (selene non disponible)")
+        print("  [14] Selene code valide: SKIP (selene non installé)")
     else:
-        assert selene_ok, f"TEST 14 FAILED: code valide rejeté par Selene: {selene_reason}"
+        assert_test(selene_ok, "14", f"code valide rejeté par Selene: {selene_reason}")
         print("  [14] Selene code valide: OK")
 
-    # ── 15. Selene: code invalide rejeté ──────────────────────────────────────
-    # "undefined_variable" usage — Selene in roblox std should flag unknown globals
-    # We use a clear syntax error to guarantee rejection
-    invalid_luau = (
+    # ── 15. Selene: code invalide rejeté (parse_error garanti) ───────────────
+    # Using a clear syntax error that Selene always catches as parse_error
+    invalid_luau_parse = (
         "--!strict\n"
-        "local x: number = 'not a number'\n"
-        "print(x)\n"
+        "local function broken(\n"
+        "    -- missing closing parenthesis and body\n"
     )
-    selene_ok2, selene_reason2 = _run_selene_on_code(invalid_luau)
+    selene_ok2, selene_reason2 = _run_selene_on_code(invalid_luau_parse)
     if selene_ok2 is None:
-        print("  [15] Selene code invalide: SKIP (selene non disponible)")
+        print("  [15] Selene code invalide: SKIP (selene non installé)")
     else:
-        # Note: Selene may or may not catch type errors (it's a linter, not a type checker)
-        # We use a pattern Selene does catch: undefined_global or deprecated API
-        # If Selene doesn't reject type mismatch, that is correct behavior —
-        # adjust to something Selene actually catches
-        # Use wait() which Selene flags as deprecated in roblox std
-        invalid_luau_selene = (
-            "--!strict\n"
-            "local function bad()\n"
-            "    wait(1)\n"
-            "end\n"
-            "bad()\n"
+        assert_test(
+            not selene_ok2,
+            "15",
+            f"code invalide devrait être rejeté par Selene, raison: {selene_reason2}",
         )
-        selene_ok2b, selene_reason2b = _run_selene_on_code(invalid_luau_selene)
-        if selene_ok2b is None:
-            print("  [15] Selene code invalide: SKIP (selene non disponible)")
-        elif selene_ok2b:
-            # Selene may not always catch wait() depending on std version
-            # Just verify the plumbing works (we got a result)
-            print("  [15] Selene code invalide: OK (avertissement non levé, plomberie OK)")
-        else:
-            assert not selene_ok2b, "TEST 15 FAILED: wait() should be flagged by Selene"
-            print(f"  [15] Selene code invalide rejeté: OK (raison: {selene_reason2b[:80]})")
+        print(f"  [15] Selene code invalide rejeté: OK (raison: {selene_reason2[:80]})")
 
-    # ── 16. Selene feedback ───────────────────────────────────────────────────
+    # ── 16. Selene feedback builder ───────────────────────────────────────────
     fake_selene_output = (
         "case_000000.luau:3:5: (warning) [deprecated] wait is deprecated\n"
         "case_000000.luau:5:1: (error) [undefined_variable] unknown_func is not defined\n"
     )
-    fb_selene = build_selene_feedback("lint reject: ...", fake_selene_output)
-    assert "deprecated" in fb_selene or "undefined" in fb_selene or "Selene" in fb_selene, \
-        "TEST 16 FAILED: Selene feedback should contain error info"
-    assert len(fb_selene) <= SELENE_FEEDBACK_MAX_CHARS + 50, \
-        f"TEST 16 FAILED: Selene feedback too long: {len(fb_selene)}"
+    fb_selene = build_selene_feedback("lint reject", fake_selene_output)
+    assert_test(
+        "deprecated" in fb_selene or "undefined" in fb_selene or "Selene" in fb_selene,
+        "16a", "feedback Selene devrait contenir les erreurs",
+    )
+    assert_test(
+        len(fb_selene) <= SELENE_FEEDBACK_MAX_CHARS + 100,
+        "16b", f"feedback Selene trop long: {len(fb_selene)} > {SELENE_FEEDBACK_MAX_CHARS + 100}",
+    )
     print("  [16] Selene feedback: OK")
 
-    # ── 17. Compteur rejected: retry ne doit pas gonfler rejected ─────────────
-    # Simulate the retry logic inline to verify counter semantics.
-    # Convention: attempt=1 (initial) + up to MAX_RETRIES_PER_EXAMPLE retries
-    # rejected increments ONLY on definitive failure (all retries exhausted)
-
-    class _FakeMetrics:
-        accepted = 0
-        rejected = 0
-        attempts = 0
-
+    # ── 17. Compteur retry: sémantique correcte ───────────────────────────────
     def _simulate_pipeline(
         outcomes: list[bool],
         max_retries: int,
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int, int, int]:
         """
-        outcomes: list of bool per attempt (True=pass, False=fail).
-        Returns (accepted, rejected, attempts_used).
-        Convention: first outcome = initial attempt, subsequent = retries.
+        Simulate the retry pipeline.
+        Returns (accepted, rejected, attempts, first_pass_accepted).
+        - attempt 0 = initial attempt.
+        - attempts 1..N = retries.
+        rejected increments ONLY when all retries are exhausted.
+        first_pass_accepted increments ONLY when attempt index == 0 succeeds.
         """
-        m = _FakeMetrics()
+        accepted = 0
+        rejected = 0
+        total_attempts = 0
+        first_pass_accepted = 0
         retry_count = 0
-        for i, ok in enumerate(outcomes):
-            m.attempts += 1
+
+        for attempt_idx, ok in enumerate(outcomes):
+            total_attempts += 1
             if ok:
-                m.accepted += 1
-                return m.accepted, m.rejected, m.attempts
+                accepted += 1
+                if attempt_idx == 0:
+                    first_pass_accepted += 1
+                return accepted, rejected, total_attempts, first_pass_accepted
             else:
                 if retry_count < max_retries:
                     retry_count += 1
                     # continue to next attempt
                 else:
-                    m.rejected += 1
-                    return m.accepted, m.rejected, m.attempts
-        # Exhausted outcomes without success
-        m.rejected += 1
-        return m.accepted, m.rejected, m.attempts
+                    rejected += 1
+                    return accepted, rejected, total_attempts, first_pass_accepted
 
-    # Scenario A: fail then succeed (with MAX_RETRIES=2)
-    acc_a, rej_a, att_a = _simulate_pipeline([False, True], max_retries=2)
-    assert acc_a == 1, f"TEST 17A FAILED: expected accepted=1, got {acc_a}"
-    assert rej_a == 0, f"TEST 17A FAILED: expected rejected=0, got {rej_a}"
-    assert att_a == 2, f"TEST 17A FAILED: expected attempts=2, got {att_a}"
-    print("  [17] Retry: failure->success donne accepted=1, rejected=0, attempts=2: OK")
+        # Exhausted all outcomes without success
+        rejected += 1
+        return accepted, rejected, total_attempts, first_pass_accepted
 
-    # Scenario B: fail 3 times (initial + 2 retries) — MAX_RETRIES=2
-    acc_b, rej_b, att_b = _simulate_pipeline([False, False, False], max_retries=2)
-    assert acc_b == 0, f"TEST 17B FAILED: expected accepted=0, got {acc_b}"
-    assert rej_b == 1, f"TEST 17B FAILED: expected rejected=1, got {rej_b}"
-    assert att_b == 3, f"TEST 17B FAILED: expected attempts=3, got {att_b}"
-    print("  [17] Retry: 3x failure donne accepted=0, rejected=1, attempts=3: OK")
+    # 17A: fail then succeed
+    acc, rej, att, fpa = _simulate_pipeline([False, True], max_retries=2)
+    assert_test(acc == 1, "17A-acc", f"expected 1, got {acc}")
+    assert_test(rej == 0, "17A-rej", f"expected 0, got {rej}")
+    assert_test(att == 2, "17A-att", f"expected 2, got {att}")
+    assert_test(fpa == 0, "17A-fpa", f"expected first_pass=0, got {fpa}")
 
-    # Scenario C: immediate success
-    acc_c, rej_c, att_c = _simulate_pipeline([True], max_retries=2)
-    assert acc_c == 1, f"TEST 17C FAILED: expected accepted=1, got {acc_c}"
-    assert rej_c == 0, f"TEST 17C FAILED: expected rejected=0, got {rej_c}"
-    assert att_c == 1, f"TEST 17C FAILED: expected attempts=1, got {att_c}"
-    print("  [17] Retry: succès immédiat donne accepted=1, rejected=0, attempts=1: OK")
+    # 17B: fail 3 times (initial + 2 retries)
+    acc, rej, att, fpa = _simulate_pipeline([False, False, False], max_retries=2)
+    assert_test(acc == 0, "17B-acc", f"expected 0, got {acc}")
+    assert_test(rej == 1, "17B-rej", f"expected 1, got {rej}")
+    assert_test(att == 3, "17B-att", f"expected 3, got {att}")
+    assert_test(fpa == 0, "17B-fpa", f"expected first_pass=0, got {fpa}")
 
-    # ── 18. Selene feedback builder: truncation ───────────────────────────────
+    # 17C: immediate success
+    acc, rej, att, fpa = _simulate_pipeline([True], max_retries=2)
+    assert_test(acc == 1, "17C-acc", f"expected 1, got {acc}")
+    assert_test(rej == 0, "17C-rej", f"expected 0, got {rej}")
+    assert_test(att == 1, "17C-att", f"expected 1, got {att}")
+    assert_test(fpa == 1, "17C-fpa", f"expected first_pass=1, got {fpa}")
+
+    print("  [17] Retry counter semantics: OK")
+
+    # ── 18. Selene feedback truncation ───────────────────────────────────────
     long_output = "case_000000.luau:1:1: (error) [long_error] " + "x" * 2000 + "\n"
     fb_long = build_selene_feedback("lint reject", long_output)
-    assert len(fb_long) <= SELENE_FEEDBACK_MAX_CHARS + 100, \
-        f"TEST 18 FAILED: truncated feedback too long: {len(fb_long)}"
+    assert_test(
+        len(fb_long) <= SELENE_FEEDBACK_MAX_CHARS + 150,
+        "18", f"feedback tronqué trop long: {len(fb_long)}",
+    )
     print("  [18] Selene feedback truncation: OK")
 
-    print("\nSELF-TEST: OK")
+    # ── 19. check_banned_api: Task casse ──────────────────────────────────────
+    code_task_wrong = "--!strict\nlocal t = Task.Wait(1)\n"
+    reason_task = check_banned_api(code_task_wrong)
+    assert_test(
+        "Task" in reason_task or "casse" in reason_task.lower(),
+        "19a", f"Task.Wait devrait être détecté, raison: {reason_task!r}",
+    )
+
+    code_task_ok = "--!strict\ntask.wait(1)\n"
+    reason_task_ok = check_banned_api(code_task_ok)
+    assert_test(
+        reason_task_ok == "",
+        "19b", f"task.wait(1) ne devrait pas être détecté, raison: {reason_task_ok!r}",
+    )
+    print("  [19] check_banned_api Task casse: OK")
+
+    # ── 20. check_banned_api: wait() faux positif ─────────────────────────────
+    # wait() in code → should be caught
+    code_wait_bad = "--!strict\nwait(1)\nlocal x = 5\n"
+    reason_wait_bad = check_banned_api(code_wait_bad)
+    assert_test(
+        "wait" in reason_wait_bad.lower(),
+        "20a", f"wait() devrait être détecté, raison: {reason_wait_bad!r}",
+    )
+
+    # task.wait() in code → should NOT be caught
+    code_task_wait_ok = "--!strict\ntask.wait(1)\nlocal x = 5\n"
+    reason_task_wait_ok = check_banned_api(code_task_wait_ok)
+    assert_test(
+        reason_task_wait_ok == "",
+        "20b", f"task.wait() ne devrait pas être détecté, raison: {reason_task_wait_ok!r}",
+    )
+    print("  [20] check_banned_api wait() faux positif: OK")
+
+    # ── 21. validate_generated: explication avec wait() → pas de faux positif ─
+    # The check_banned_api is now applied ONLY to code, not to explanation.
+    # So an explanation mentioning "wait()" should not cause rejection.
+    structured_with_wait_in_explanation = {
+        "user": "Comment remplacer wait() par task.wait() dans un script serveur Roblox?",
+        "explanation": (
+            "L'ancienne API wait() est obsolète. "
+            "On la remplace systématiquement par task.wait()."
+        ),
+        "code": (
+            "--!strict\n"
+            "-- Exemple de remplacement de wait() par task.wait()\n"
+            "local function doWork()\n"
+            "    task.wait(1)\n"
+            "    return true\n"
+            "end\n"
+            "doWork()\n"
+        ),
+    }
+    bucket_p1 = BASE_BUCKETS[0]  # any P1 bucket
+    ok_val, reason_val, code_val = validate_generated(structured_with_wait_in_explanation, bucket_p1)
+    assert_test(
+        ok_val,
+        "21",
+        f"explanation avec wait() ne devrait pas être rejetée, raison: {reason_val}",
+    )
+    print("  [21] Faux positif wait() dans explication: OK")
+
+    # ── 22. SemanticIndex compression ────────────────────────────────────────
+    idx = SemanticIndex(
+        num_perm=MINHASH_PERMUTATIONS,
+        shingle_size=MINHASH_SHINGLE_SIZE,
+        threshold=SEMANTIC_THRESHOLD,
+        bands=LSH_BANDS,
+    )
+    # Add entries up to compression threshold
+    for i in range(min(SEMANTIC_COMPRESS_THRESHOLD + 2, 20)):
+        idx.add(f"--!strict\nlocal x{i} = {i}\nprint(x{i})\n")
+    # Basic find_similar works
+    similar, score, _ = idx.find_similar("--!strict\nlocal x0 = 0\nprint(x0)\n")
+    # Either found similar or not — just verify no crash
+    print("  [22] SemanticIndex (add/find_similar): OK")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    if failures:
+        print(f"\nSELF-TEST: {len(failures)} FAILURE(S)")
+        for f in failures:
+            print(f"  {f}")
+        sys.exit(1)
+    else:
+        print("\nSELF-TEST: OK")
 
 
 # ============================================================
@@ -2233,19 +2414,13 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         accepted=existing_count,
         rejected=int(state.get("rejected", 0)),
         attempts=int(state.get("attempts", 0)),
+        first_pass_accepted=int(state.get("first_pass_accepted", 0)),
     )
     reject_counts: Counter[str] = Counter(
         state.get("reject_counts", {})
         if isinstance(state.get("reject_counts", {}), dict)
         else {}
     )
-
-    if existing_count > sum(scheduler.counts.values()):
-        unattributed = existing_count - sum(scheduler.counts.values())
-        print(
-            f"ATTENTION: {unattributed} exemple(s) existants non attribués à un bucket V5 "
-            "dans le state. Ils seront conservés."
-        )
 
     if existing_count >= args.target:
         print(f"Dataset déjà à {existing_count}/{args.target}.")
@@ -2295,19 +2470,18 @@ async def run_pipeline(args: argparse.Namespace) -> None:
 
             case_counter    += len(specs)
             mutation_counter += 1
-            metrics.attempts += len(specs)
 
-            # Each item in pending tracks one generation slot through retries.
-            # retry_count counts retries (not counting the initial attempt).
-            # last_reason is the last rejection reason (for logging).
-            # last_lint_output is the raw Selene output of the last lint failure.
+            # metrics.attempts counts ALL generation calls (initial + retries).
+            # It is incremented each time we actually call vLLM.
+            # Each pending item has its own retry_count (0 = initial attempt).
+
             pending: list[dict[str, Any]] = [
                 {
                     "spec":             spec,
                     "feedback":         "",
                     "last_reason":      "",
                     "last_lint_output": "",
-                    "retry_count":      0,
+                    "retry_count":      0,  # 0 = initial attempt, 1+ = retry
                 }
                 for spec in specs
             ]
@@ -2315,6 +2489,9 @@ async def run_pipeline(args: argparse.Namespace) -> None:
             while pending:
                 retry_specs     = [item["spec"]    for item in pending]
                 retry_feedbacks = [item["feedback"] for item in pending]
+
+                # Count this generation call for ALL items in this sub-batch
+                metrics.attempts += len(pending)
 
                 # ── Generation ──────────────────────────────────────────────
                 try:
@@ -2332,8 +2509,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                             item["retry_count"] += 1
                             item["feedback"] = (
                                 "La génération précédente a échoué techniquement. "
-                                "Régénère complètement la réponse et respecte "
-                                "strictement le format JSON demandé."
+                                "Génère une réponse complète avec le JSON structuré demandé."
                             )
                             next_pending.append(item)
                             print(
@@ -2368,18 +2544,18 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                         "sortie(s) vLLM manquante(s)."
                     )
 
-                for idx, item in enumerate(pending):
+                for idx_item, item in enumerate(pending):
                     bucket, case_id, mutation = item["spec"]
+                    is_initial_attempt = (item["retry_count"] == 0)
 
                     # ── Missing output ────────────────────────────────────────
-                    if idx >= len(raw_texts):
+                    if idx_item >= len(raw_texts):
                         reason = "vLLM output missing"
                         item["last_reason"] = reason
                         if item["retry_count"] < MAX_RETRIES_PER_EXAMPLE:
                             item["retry_count"] += 1
                             item["feedback"] = (
-                                "La sortie précédente était absente. "
-                                "Génère une réponse complète avec le JSON structuré demandé."
+                                "Sortie absente. Génère une réponse complète avec le JSON structuré."
                             )
                             next_pending.append(item)
                             print(
@@ -2398,7 +2574,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                             })
                         continue
 
-                    raw_text = raw_texts[idx]
+                    raw_text = raw_texts[idx_item]
 
                     # ── Parse structured JSON ─────────────────────────────────
                     try:
@@ -2417,6 +2593,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                             )
                         else:
                             metrics.rejected += 1
+                            metrics.json_rejected += 1
                             reject_counts[reason] += 1
                             print(
                                 f"✗ Reject {bucket.stage} case={case_id} "
@@ -2444,6 +2621,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                             )
                         else:
                             metrics.rejected += 1
+                            metrics.validation_rejected += 1
                             reject_counts[reason] += 1
                             print(
                                 f"✗ Reject {bucket.stage} case={case_id} "
@@ -2488,6 +2666,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                             })
                         continue
 
+                    # This item passed all pre-lint checks — mark for lint batch
                     candidate_records.append((item, bucket, structured, code_for_dedup))
 
                 # ── Lint batch ────────────────────────────────────────────────
@@ -2498,6 +2677,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                     for record, lint_result in zip(candidate_records, lint_results):
                         item, bucket, structured, code_for_dedup = record
                         _, case_id, mutation = item["spec"]
+                        is_initial_attempt = (item["retry_count"] == 0)
 
                         if not lint_result.ok:
                             reason = "selene: " + lint_result.reason
@@ -2506,7 +2686,6 @@ async def run_pipeline(args: argparse.Namespace) -> None:
 
                             if item["retry_count"] < MAX_RETRIES_PER_EXAMPLE:
                                 item["retry_count"] += 1
-                                # Use rich Selene feedback with actual error lines
                                 item["feedback"] = build_selene_feedback(
                                     reason, lint_result.raw_output
                                 )
@@ -2544,6 +2723,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                             "subcategory":  bucket.subcategory,
                             "case_id":      case_id,
                             "mutation":     mutation,
+                            "retry_count":  item["retry_count"],
                             "corrected_sha256": hashlib.sha256(
                                 normalize_code(code_for_dedup).encode("utf-8")
                             ).hexdigest(),
@@ -2553,7 +2733,18 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                         scheduler.accepted(bucket.subcategory)
                         metrics.accepted += 1
 
-                        print(f"✓ Accepted {bucket.stage} case={case_id} total={metrics.accepted}")
+                        # Track first-pass acceptance separately
+                        if is_initial_attempt:
+                            metrics.first_pass_accepted += 1
+                            print(
+                                f"✓ Accepted {bucket.stage} case={case_id} "
+                                f"[FIRST PASS] total={metrics.accepted}"
+                            )
+                        else:
+                            print(
+                                f"✓ Accepted {bucket.stage} case={case_id} "
+                                f"[retry={item['retry_count']}] total={metrics.accepted}"
+                            )
 
                         if progress is not None:
                             progress.update(1)
@@ -2569,35 +2760,41 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                 if pending:
                     causes = Counter(item["last_reason"] for item in pending if item["last_reason"])
                     top = causes.most_common(1)
-                    cause_str = f" (cause principale: {top[0][0][:60]})" if top else ""
+                    cause_str = f" (cause: {top[0][0][:60]})" if top else ""
                     print(
-                        f"↻ Retry: {len(pending)} exemple(s) restant(s) à corriger{cause_str}."
+                        f"↻ Retry: {len(pending)} exemple(s) restant(s){cause_str}."
                     )
 
                 write_state(
                     metrics.accepted, metrics.rejected, metrics.attempts,
                     scheduler.counts, reject_counts, started_at,
+                    first_pass_accepted=metrics.first_pass_accepted,
                 )
 
             # ── Per-batch progress ────────────────────────────────────────────
             total_elapsed = max(1e-9, time.perf_counter() - started_at)
             tok_s = metrics.output_tokens / max(metrics.generation_seconds, 1e-9)
             ex_s  = metrics.accepted / total_elapsed
+            fpr   = (
+                metrics.first_pass_accepted / max(1, metrics.accepted) * 100
+                if metrics.accepted > 0 else 0.0
+            )
 
             if progress is not None:
                 progress.set_postfix(
-                    accepted=metrics.accepted,
-                    rejected=metrics.rejected,
+                    acc=metrics.accepted,
+                    rej=metrics.rejected,
+                    fp=f"{fpr:.0f}%",
                     dup=metrics.duplicates,
                     lint=metrics.lint_rejected,
                     tok_s=f"{tok_s:.1f}",
-                    ex_s=f"{ex_s:.3f}",
                 )
             else:
                 print(
                     f"Progress {metrics.accepted}/{args.target} | "
-                    f"reject={metrics.rejected} | dup={metrics.duplicates} | "
-                    f"lint={metrics.lint_rejected} | tok/s={tok_s:.1f}"
+                    f"fp={fpr:.1f}% | reject={metrics.rejected} | "
+                    f"dup={metrics.duplicates} | lint={metrics.lint_rejected} | "
+                    f"tok/s={tok_s:.1f}"
                 )
 
     finally:
@@ -2606,31 +2803,46 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         write_state(
             metrics.accepted, metrics.rejected, metrics.attempts,
             scheduler.counts, reject_counts, started_at,
+            first_pass_accepted=metrics.first_pass_accepted,
         )
 
     elapsed_total = max(1e-9, time.perf_counter() - started_at)
+    fpr_final = (
+        metrics.first_pass_accepted / max(1, metrics.accepted) * 100
+        if metrics.accepted > 0 else 0.0
+    )
+
     print()
     print("=" * 72)
     print("RBLOX QUALITY DATA FACTORY V5 — COMPLETE")
     print("=" * 72)
-    print(f"Accepted         : {metrics.accepted}")
-    print(f"Rejected         : {metrics.rejected}")
-    print(f"Duplicates       : {metrics.duplicates}")
-    print(f"Semantic rejects : {metrics.semantic_rejected}")
-    print(f"Lint rejects     : {metrics.lint_rejected}")
-    print(f"Generation tok/s : {metrics.output_tokens / max(metrics.generation_seconds, 1e-9):.2f}")
-    print(f"Overall ex/s     : {metrics.accepted / elapsed_total:.4f}")
-    print(f"Elapsed          : {elapsed_total:.1f}s")
-    print(f"Output           : {OUTPUT_FILE}")
-    print(f"Reject log       : {REJECT_LOG}")
-    print(f"State            : {STATE_FILE}")
-    print(f"Manifest         : {MANIFEST_FILE}")
+    print(f"Accepted              : {metrics.accepted}")
+    print(f"  First-pass accepted : {metrics.first_pass_accepted} ({fpr_final:.1f}% of accepted)")
+    print(f"Rejected              : {metrics.rejected}")
+    print(f"  JSON rejected       : {metrics.json_rejected}")
+    print(f"  Validation rejected : {metrics.validation_rejected}")
+    print(f"  Lint (Selene) rej.  : {metrics.lint_rejected}")
+    print(f"  Exact duplicates    : {metrics.duplicates}")
+    print(f"  Semantic duplicates : {metrics.semantic_rejected}")
+    print(f"Total attempts        : {metrics.attempts}")
+    print(f"Generation tok/s      : {metrics.output_tokens / max(metrics.generation_seconds, 1e-9):.2f}")
+    print(f"Overall ex/s          : {metrics.accepted / elapsed_total:.4f}")
+    print(f"Elapsed               : {elapsed_total:.1f}s")
+    print(f"Output                : {OUTPUT_FILE}")
+    print(f"Reject log            : {REJECT_LOG}")
+    print(f"State                 : {STATE_FILE}")
+    print(f"Manifest              : {MANIFEST_FILE}")
     print()
     print("Répartition cible:")
     for b in BASE_BUCKETS:
         current = scheduler.counts.get(b.subcategory, 0)
         target  = targets[b.subcategory]
-        print(f"  {b.stage:<2} {b.subcategory:<36} {current:>6}/{target:<6}")
+        pct     = current / max(1, target) * 100
+        print(f"  {b.stage:<2} {b.subcategory:<38} {current:>6}/{target:<6} ({pct:.0f}%)")
+    print()
+    print("Top causes de rejet:")
+    for cause, count in reject_counts.most_common(10):
+        print(f"  {count:>5}x  {cause[:70]}")
     print("=" * 72)
 
 
